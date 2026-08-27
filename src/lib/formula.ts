@@ -7,15 +7,20 @@
 // - non-finite results (division by zero, non-numeric text) become #ERROR
 
 export const ERROR_VALUE = "#ERROR";
+export const REF_ERROR_VALUE = "#REF!";
 
 export type GetRaw = (cellId: string) => string | undefined;
 
 type Token =
   | { type: "num"; value: number }
   | { type: "ref"; id: string }
+  | { type: "referr" }
   | { type: "op"; op: "+" | "-" | "*" | "/" | "(" | ")" };
 
 class FormulaError extends Error {}
+
+/** A formula touching a deleted cell reference (#REF!), shown distinctly. */
+class RefError extends FormulaError {}
 
 function tokenize(src: string): Array<Token> {
   const tokens: Array<Token> = [];
@@ -29,6 +34,11 @@ function tokenize(src: string): Array<Token> {
     if (ch === "+" || ch === "-" || ch === "*" || ch === "/" || ch === "(" || ch === ")") {
       tokens.push({ type: "op", op: ch });
       i++;
+      continue;
+    }
+    if (src.startsWith(REF_ERROR_VALUE, i)) {
+      tokens.push({ type: "referr" });
+      i += REF_ERROR_VALUE.length;
       continue;
     }
     const numMatch = /^\d*\.?\d+/.exec(src.slice(i));
@@ -123,6 +133,9 @@ class Parser {
       this.pos++;
       return this.refValue(t.id);
     }
+    if (t.type === "referr") {
+      throw new RefError("deleted cell reference");
+    }
     throw new FormulaError("unexpected token");
   }
 
@@ -165,7 +178,46 @@ export function displayValue(selfId: string, raw: string | undefined, getRaw: Ge
     const value = evaluateExpression(raw.slice(1), getRaw, path);
     if (!Number.isFinite(value)) return ERROR_VALUE;
     return formatNumber(value);
-  } catch {
-    return ERROR_VALUE;
+  } catch (e) {
+    // RefError propagates through recursive refValue calls, so a cell that
+    // references a #REF! formula shows #REF! too (Excel-style chaining).
+    return e instanceof RefError ? REF_ERROR_VALUE : ERROR_VALUE;
   }
+}
+
+/**
+ * Rewrite every cell reference in a formula through `mapRef`.
+ * `mapRef` returns the new id, or null for a deleted cell (replaced with
+ * the literal #REF!). Non-formula raws and unparsable formulas are returned
+ * unchanged. Replacement is token-positional: everything between references
+ * (operators, numbers, spacing) is preserved as written.
+ */
+export function rewriteFormulaRefs(raw: string, mapRef: (id: string) => string | null): string {
+  if (!raw.startsWith("=")) return raw;
+  const src = raw.slice(1);
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    if (src.startsWith(REF_ERROR_VALUE, i)) {
+      out += REF_ERROR_VALUE;
+      i += REF_ERROR_VALUE.length;
+      continue;
+    }
+    // numbers first, so digits are never consumed as part of a reference
+    const numMatch = /^\d*\.?\d+/.exec(src.slice(i));
+    if (numMatch) {
+      out += numMatch[0];
+      i += numMatch[0].length;
+      continue;
+    }
+    const refMatch = /^[A-Za-z]+\d+/.exec(src.slice(i));
+    if (refMatch) {
+      out += mapRef(refMatch[0].toUpperCase()) ?? REF_ERROR_VALUE;
+      i += refMatch[0].length;
+      continue;
+    }
+    out += src[i];
+    i++;
+  }
+  return `=${out}`;
 }

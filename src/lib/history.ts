@@ -5,7 +5,7 @@
 
 import { createAtom } from "@tanstack/store";
 
-import { cellsCollection } from "#/db-collections/cells";
+import { applyCellsDiff, cellsCollection } from "#/db-collections/cells";
 import { persistWidths } from "#/db-collections/sheet-meta";
 import { cellSelectionAtom, columnSizingAtom, sheetStore, stopEditing } from "#/lib/sheet-store";
 
@@ -34,7 +34,9 @@ function syncHistoryAtom() {
 function captureSnapshot(): Snapshot {
   const { rows, cols } = sheetStore.state;
   return {
-    cells: cellsCollection.toArray.map((c) => ({ ...c })),
+    // copy only the cell fields: synced rows can carry internal metadata
+    // ($synced/$origin) that must not end up back in storage on restore
+    cells: cellsCollection.toArray.map((c) => ({ id: c.id, raw: c.raw })),
     rows,
     cols,
     widths: { ...columnSizingAtom.get() },
@@ -42,35 +44,9 @@ function captureSnapshot(): Snapshot {
   };
 }
 
-/**
- * Apply a snapshot's cells as a diff. Cells that only changed value are
- * updated in place — delete + reinsert of the same key can make the live
- * query's contributors non-congruent (react-db 0.x).
- */
-function restoreCells(cells: Array<Cell>) {
-  const target = new Map(cells.map((c) => [c.id, c.raw]));
-  const currentIds = new Set<string>();
-  const toDelete: Array<string> = [];
-  const toUpdate: Array<Cell> = [];
-  for (const cell of cellsCollection.toArray) {
-    currentIds.add(cell.id);
-    const raw = target.get(cell.id);
-    if (raw === undefined) toDelete.push(cell.id);
-    else if (raw !== cell.raw) toUpdate.push({ id: cell.id, raw });
-  }
-  const toInsert = cells.filter((c) => !currentIds.has(c.id)).map((c) => ({ ...c }));
-  if (toDelete.length) cellsCollection.delete(toDelete);
-  for (const cell of toUpdate) {
-    cellsCollection.update(cell.id, (draft) => {
-      draft.raw = cell.raw;
-    });
-  }
-  if (toInsert.length) cellsCollection.insert(toInsert);
-}
-
 function restoreSnapshot(snapshot: Snapshot) {
   stopEditing();
-  restoreCells(snapshot.cells);
+  applyCellsDiff(snapshot.cells);
   sheetStore.setState((s) => ({ ...s, rows: snapshot.rows, cols: snapshot.cols }));
   columnSizingAtom.set({ ...snapshot.widths });
   persistWidths(snapshot.widths);

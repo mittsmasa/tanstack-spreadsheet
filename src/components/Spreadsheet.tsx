@@ -31,8 +31,6 @@ import {
   stopEditing,
 } from "#/lib/sheet-store";
 import {
-  countCellsInColumns,
-  countCellsInRows,
   deleteColumns,
   deleteRows,
   insertColumns,
@@ -358,25 +356,23 @@ function StructureToolbar() {
   const colSpan = fullColumnSpan(sel, rows);
   const rowSpan = fullRowSpan(sel, cols);
 
-  const confirmAndDeleteColumns = () => {
+  // No confirm dialog: undo is the safety net for deletes (and native dialogs
+  // are suppressed in some embedded browsers, which silently aborted deletes).
+  const deleteSelectedColumns = () => {
     if (!colSpan) return;
     const targets = Array.from(
       { length: colSpan.end - colSpan.start + 1 },
       (_, i) => colSpan.start + i,
     );
-    const count = countCellsInColumns(targets);
-    if (count > 0 && !window.confirm(`${count} セルのデータが消えます。列を削除しますか？`)) return;
     if (!deleteColumns(targets)) window.alert("最低 1 列は残す必要があります");
   };
 
-  const confirmAndDeleteRows = () => {
+  const deleteSelectedRows = () => {
     if (!rowSpan) return;
     const targets = Array.from(
       { length: rowSpan.end - rowSpan.start + 1 },
       (_, i) => rowSpan.start + i,
     );
-    const count = countCellsInRows(targets);
-    if (count > 0 && !window.confirm(`${count} セルのデータが消えます。行を削除しますか？`)) return;
     if (!deleteRows(targets)) window.alert("最低 1 行は残す必要があります");
   };
 
@@ -392,7 +388,7 @@ function StructureToolbar() {
         </button>
       )}
       {colSpan && (
-        <button type="button" className={toolbarButtonClass} onClick={confirmAndDeleteColumns}>
+        <button type="button" className={toolbarButtonClass} onClick={deleteSelectedColumns}>
           {colSpan.start === colSpan.end
             ? `${columnLabel(colSpan.start)} 列を削除`
             : `${columnLabel(colSpan.start)}〜${columnLabel(colSpan.end)} 列を削除`}
@@ -408,7 +404,7 @@ function StructureToolbar() {
         </button>
       )}
       {rowSpan && (
-        <button type="button" className={toolbarButtonClass} onClick={confirmAndDeleteRows}>
+        <button type="button" className={toolbarButtonClass} onClick={deleteSelectedRows}>
           {rowSpan.start === rowSpan.end
             ? `行 ${rowSpan.start} を削除`
             : `行 ${rowSpan.start}〜${rowSpan.end} を削除`}

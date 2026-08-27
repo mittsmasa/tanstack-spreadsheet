@@ -3,10 +3,11 @@
 // Every operation builds a position map (old index -> new index | null for
 // deleted) and applies it in one pass: cell ids are re-keyed, formula
 // references are rewritten through the same map (deleted refs become #REF!),
-// and column widths follow their column. Changes hit the collection as one
-// bulk delete + one bulk insert.
+// and column widths follow their column. Changes are applied as a diff
+// against the full target state (applyCellsDiff) so the same key is never
+// deleted and reinserted in one batch.
 
-import { cellsCollection } from "#/db-collections/cells";
+import { applyCellsDiff, cellsCollection } from "#/db-collections/cells";
 import { persistWidths } from "#/db-collections/sheet-meta";
 import { cellId, columnLabel, labelToColumnIndex, parseCellId } from "#/lib/columns";
 import { rewriteFormulaRefs } from "#/lib/formula";
@@ -61,18 +62,13 @@ function blockMoveMap(srcStart: number, srcEnd: number, dest: number): IndexMap 
 }
 
 function remapCells(mapCol: IndexMap, mapRow: IndexMap) {
-  const toDelete: Array<string> = [];
-  const toInsert: Array<Cell> = [];
+  const target: Array<Cell> = [];
   for (const cell of cellsCollection.toArray) {
     const pos = parseCellId(cell.id);
     if (!pos) continue;
     const newCol = mapCol(pos.colIndex);
     const newRow = mapRow(pos.rowNumber - 1);
-    if (newCol === null || newRow === null) {
-      toDelete.push(cell.id);
-      continue;
-    }
-    const newId = cellId(newCol, newRow + 1);
+    if (newCol === null || newRow === null) continue;
     const newRaw = rewriteFormulaRefs(cell.raw, (refId) => {
       const ref = parseCellId(refId);
       if (!ref) return refId;
@@ -80,13 +76,9 @@ function remapCells(mapCol: IndexMap, mapRow: IndexMap) {
       const r = mapRow(ref.rowNumber - 1);
       return c === null || r === null ? null : cellId(c, r + 1);
     });
-    if (newId !== cell.id || newRaw !== cell.raw) {
-      toDelete.push(cell.id);
-      toInsert.push({ id: newId, raw: newRaw });
-    }
+    target.push({ id: cellId(newCol, newRow + 1), raw: newRaw });
   }
-  if (toDelete.length) cellsCollection.delete(toDelete);
-  if (toInsert.length) cellsCollection.insert(toInsert);
+  applyCellsDiff(target);
 }
 
 function remapWidths(mapCol: IndexMap) {
@@ -99,24 +91,6 @@ function remapWidths(mapCol: IndexMap) {
   }
   columnSizingAtom.set(next);
   persistWidths(next);
-}
-
-/** How many stored cells sit in the given rows (for delete confirmation). */
-export function countCellsInRows(rowNumbers: ReadonlyArray<number>): number {
-  const set = new Set(rowNumbers);
-  return cellsCollection.toArray.filter((c) => {
-    const pos = parseCellId(c.id);
-    return pos !== null && set.has(pos.rowNumber);
-  }).length;
-}
-
-/** How many stored cells sit in the given columns (for delete confirmation). */
-export function countCellsInColumns(colIndexes: ReadonlyArray<number>): number {
-  const set = new Set(colIndexes);
-  return cellsCollection.toArray.filter((c) => {
-    const pos = parseCellId(c.id);
-    return pos !== null && set.has(pos.colIndex);
-  }).length;
 }
 
 /** Delete rows (1-based). Refuses to delete every row. */

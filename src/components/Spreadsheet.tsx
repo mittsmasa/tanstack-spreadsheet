@@ -15,6 +15,7 @@ import { cellsCollection, setCell } from "#/db-collections/cells";
 import { loadPersistedWidths, persistWidthsDebounced } from "#/db-collections/sheet-meta";
 import { cellId, columnLabel, labelToColumnIndex, parseCellId } from "#/lib/columns";
 import { ERROR_VALUE, REF_ERROR_VALUE, displayValue } from "#/lib/formula";
+import { historyAtom, recordHistory, redo, undo } from "#/lib/history";
 import {
   activeCellIdOf,
   activeCellPos,
@@ -34,6 +35,8 @@ import {
   countCellsInRows,
   deleteColumns,
   deleteRows,
+  insertColumns,
+  insertRows,
   moveColumns,
   moveRows,
 } from "#/lib/structure";
@@ -166,6 +169,15 @@ function clickRowHeader(rowNumber: number, extend: boolean) {
   }
 }
 
+/** Commit one cell value as a single history step; no-op commits record nothing. */
+function setCellWithHistory(id: string, value: string) {
+  const current = cellsCollection.get(id)?.raw;
+  const unchanged = current === undefined ? value.trim() === "" : current === value;
+  if (unchanged) return;
+  recordHistory();
+  setCell(id, value);
+}
+
 function CellEditor({ id, initial }: { id: string; initial: string }) {
   const [value, setValue] = useState(initial);
   const committedRef = useRef(false);
@@ -173,7 +185,7 @@ function CellEditor({ id, initial }: { id: string; initial: string }) {
   const commit = (dCol: number, dRow: number) => {
     if (committedRef.current) return;
     committedRef.current = true;
-    setCell(id, value);
+    setCellWithHistory(id, value);
     stopEditing();
     if (dCol !== 0 || dRow !== 0) moveActive(dCol, dRow);
   };
@@ -291,7 +303,7 @@ function FormulaBar({ selected, raw }: { selected: string; raw: string }) {
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();
-            setCell(selected, value);
+            setCellWithHistory(selected, value);
           } else if (e.key === "Escape") {
             e.preventDefault();
             setValue(raw);
@@ -309,7 +321,33 @@ function FormulaBarSlot({ getRaw }: { getRaw: GetRaw }) {
 }
 
 const toolbarButtonClass =
-  "rounded border border-[var(--line)] bg-[var(--surface)] px-2 py-0.5 text-xs text-[var(--sea-ink)] transition hover:border-[var(--palm)]";
+  "rounded border border-[var(--line)] bg-[var(--surface)] px-2 py-0.5 text-xs text-[var(--sea-ink)] transition hover:border-[var(--palm)] disabled:cursor-default disabled:opacity-40 disabled:hover:border-[var(--line)]";
+
+function UndoRedoButtons() {
+  const { canUndo, canRedo } = useSelector(historyAtom);
+  return (
+    <>
+      <button
+        type="button"
+        className={toolbarButtonClass}
+        disabled={!canUndo}
+        onClick={undo}
+        title="元に戻す (⌘Z)"
+      >
+        ↩ 元に戻す
+      </button>
+      <button
+        type="button"
+        className={toolbarButtonClass}
+        disabled={!canRedo}
+        onClick={redo}
+        title="やり直す (⌘⇧Z)"
+      >
+        ↪ やり直す
+      </button>
+    </>
+  );
+}
 
 /** Contextual delete buttons, visible while whole rows / columns are selected. */
 function StructureToolbar() {
@@ -345,10 +383,28 @@ function StructureToolbar() {
   return (
     <>
       {colSpan && (
+        <button
+          type="button"
+          className={toolbarButtonClass}
+          onClick={() => insertColumns(colSpan.start, colSpan.end - colSpan.start + 1)}
+        >
+          左に {colSpan.end - colSpan.start + 1} 列挿入
+        </button>
+      )}
+      {colSpan && (
         <button type="button" className={toolbarButtonClass} onClick={confirmAndDeleteColumns}>
           {colSpan.start === colSpan.end
             ? `${columnLabel(colSpan.start)} 列を削除`
             : `${columnLabel(colSpan.start)}〜${columnLabel(colSpan.end)} 列を削除`}
+        </button>
+      )}
+      {rowSpan && (
+        <button
+          type="button"
+          className={toolbarButtonClass}
+          onClick={() => insertRows(rowSpan.start, rowSpan.end - rowSpan.start + 1)}
+        >
+          上に {rowSpan.end - rowSpan.start + 1} 行挿入
         </button>
       )}
       {rowSpan && (
@@ -525,6 +581,7 @@ export default function Spreadsheet() {
   const clearSelectedCells = () => {
     const leafColumns = table.getAllLeafColumns();
     const modelRows = table.getRowModel().rows;
+    const ids: Array<string> = [];
     for (const bounds of table.getCellSelectionBounds()) {
       for (let r = bounds.minRowIndex; r <= bounds.maxRowIndex; r++) {
         const rowNumber = Number(modelRows[r]?.id);
@@ -533,10 +590,13 @@ export default function Spreadsheet() {
           const column = leafColumns[c];
           if (!column || column.id === ROW_HEADER_ID) continue;
           const id = `${column.id}${rowNumber}`;
-          if (cellMap.has(id)) setCell(id, "");
+          if (cellMap.has(id)) ids.push(id);
         }
       }
     }
+    if (ids.length === 0) return;
+    recordHistory();
+    for (const id of ids) setCell(id, "");
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -567,6 +627,17 @@ export default function Spreadsheet() {
         if ((e.metaKey || e.ctrlKey) && (e.key === "a" || e.key === "A")) {
           e.preventDefault();
           table.selectAllCells();
+          return;
+        }
+        if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
+          e.preventDefault();
+          if (e.shiftKey) redo();
+          else undo();
+          return;
+        }
+        if ((e.metaKey || e.ctrlKey) && (e.key === "y" || e.key === "Y")) {
+          e.preventDefault();
+          redo();
           return;
         }
         if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
@@ -606,6 +677,7 @@ export default function Spreadsheet() {
     const lines = text.replace(/\r\n?/g, "\n").split("\n");
     if (lines[lines.length - 1] === "") lines.pop();
     if (lines.length === 0) return;
+    recordHistory();
     const origin = activeCellPos(cellSelectionAtom.get());
     let width = 0;
     lines.forEach((line, i) => {
@@ -739,12 +811,27 @@ export default function Spreadsheet() {
           tanstack-spreadsheet
         </h1>
         <div className="flex gap-1.5">
-          <button type="button" className={toolbarButtonClass} onClick={addRow}>
+          <button
+            type="button"
+            className={toolbarButtonClass}
+            onClick={() => {
+              recordHistory();
+              addRow();
+            }}
+          >
             + 行
           </button>
-          <button type="button" className={toolbarButtonClass} onClick={addColumn}>
+          <button
+            type="button"
+            className={toolbarButtonClass}
+            onClick={() => {
+              recordHistory();
+              addColumn();
+            }}
+          >
             + 列
           </button>
+          <UndoRedoButtons />
           <StructureToolbar />
         </div>
         <div className="ml-auto">

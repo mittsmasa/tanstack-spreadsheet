@@ -10,6 +10,7 @@ import { cellsCollection } from "#/db-collections/cells";
 import { persistWidths } from "#/db-collections/sheet-meta";
 import { cellId, columnLabel, labelToColumnIndex, parseCellId } from "#/lib/columns";
 import { rewriteFormulaRefs } from "#/lib/formula";
+import { recordHistory } from "#/lib/history";
 import {
   activeCellPos,
   cellSelectionAtom,
@@ -36,6 +37,11 @@ function deletionMap(deleted: ReadonlyArray<number>): IndexMap {
     }
     return index - shift;
   };
+}
+
+/** Shift everything at or past `insertAt` to make room for `count` new slots. */
+function insertionMap(insertAt: number, count: number): IndexMap {
+  return (index) => (index >= insertAt ? index + count : index);
 }
 
 /**
@@ -119,6 +125,7 @@ export function deleteRows(rowNumbers: ReadonlyArray<number>): boolean {
   const targets = [...new Set(rowNumbers.filter((r) => r >= 1 && r <= rows))];
   if (targets.length === 0 || targets.length >= rows) return false;
   stopEditing();
+  recordHistory();
   remapCells(identityMap, deletionMap(targets.map((r) => r - 1)));
   sheetStore.setState((s) => ({ ...s, rows: s.rows - targets.length }));
   const active = activeCellPos(cellSelectionAtom.get());
@@ -132,6 +139,7 @@ export function deleteColumns(colIndexes: ReadonlyArray<number>): boolean {
   const targets = [...new Set(colIndexes.filter((c) => c >= 0 && c < cols))];
   if (targets.length === 0 || targets.length >= cols) return false;
   stopEditing();
+  recordHistory();
   const mapCol = deletionMap(targets);
   remapCells(mapCol, identityMap);
   remapWidths(mapCol);
@@ -149,12 +157,65 @@ export function moveRows(srcStart: number, srcEnd: number, destBefore: number): 
   const mapRow = blockMoveMap(srcStart - 1, srcEnd - 1, destBefore - 1);
   if (!mapRow) return false;
   stopEditing();
+  recordHistory();
   remapCells(identityMap, mapRow);
   const newStart = mapRow(srcStart - 1);
   if (newStart !== null) {
     const active = activeCellPos(cellSelectionAtom.get());
     setActiveCell(active.colIndex, newStart + 1);
   }
+  return true;
+}
+
+/** Select the whole span of freshly inserted rows [start..end] (1-based). */
+function selectInsertedRows(start: number, end: number) {
+  const { cols } = sheetStore.state;
+  cellSelectionAtom.set([
+    {
+      anchorColumnId: columnLabel(0),
+      anchorRowId: String(start),
+      focusColumnId: columnLabel(cols - 1),
+      focusRowId: String(end),
+    },
+  ]);
+}
+
+/** Select the whole span of freshly inserted columns [start..end] (0-based). */
+function selectInsertedColumns(start: number, end: number) {
+  const { rows } = sheetStore.state;
+  cellSelectionAtom.set([
+    {
+      anchorColumnId: columnLabel(start),
+      anchorRowId: "1",
+      focusColumnId: columnLabel(end),
+      focusRowId: String(rows),
+    },
+  ]);
+}
+
+/** Insert `count` empty rows above row `before` (1-based). */
+export function insertRows(before: number, count: number): boolean {
+  const { rows } = sheetStore.state;
+  if (count < 1 || before < 1 || before > rows + 1) return false;
+  stopEditing();
+  recordHistory();
+  remapCells(identityMap, insertionMap(before - 1, count));
+  sheetStore.setState((s) => ({ ...s, rows: s.rows + count }));
+  selectInsertedRows(before, before + count - 1);
+  return true;
+}
+
+/** Insert `count` empty columns to the left of column `before` (0-based). */
+export function insertColumns(before: number, count: number): boolean {
+  const { cols } = sheetStore.state;
+  if (count < 1 || before < 0 || before > cols) return false;
+  stopEditing();
+  recordHistory();
+  const mapCol = insertionMap(before, count);
+  remapCells(mapCol, identityMap);
+  remapWidths(mapCol);
+  sheetStore.setState((s) => ({ ...s, cols: s.cols + count }));
+  selectInsertedColumns(before, before + count - 1);
   return true;
 }
 
@@ -166,6 +227,7 @@ export function moveColumns(srcStart: number, srcEnd: number, destBefore: number
   const mapCol = blockMoveMap(srcStart, srcEnd, destBefore);
   if (!mapCol) return false;
   stopEditing();
+  recordHistory();
   remapCells(mapCol, identityMap);
   remapWidths(mapCol);
   const newStart = mapCol(srcStart);

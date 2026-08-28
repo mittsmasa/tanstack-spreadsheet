@@ -948,7 +948,7 @@ export default function Spreadsheet() {
         </span>
         <span className="flex items-center gap-3">
           <SelectionSummary />
-          <span>{cellMap.size} セル入力済み · localStorage にタブ間同期</span>
+          <span>{cellMap.size} セル入力済み · サーバー (SQLite) にタブ間同期</span>
         </span>
       </footer>
     </div>

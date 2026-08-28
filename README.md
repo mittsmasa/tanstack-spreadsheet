@@ -9,6 +9,34 @@ pnpm install
 pnpm dev
 ```
 
+# Storage & MCP
+
+## データの保存先
+
+スプレッドシートのデータ（セル・列幅）の SSoT は dev server 内の SQLite（libsql）で、既定では `data/spreadsheet.db`（gitignore 済み）に保存される。ブラウザ側の collection はカスタム sync によるミラーで、タブ間同期は SSE（`/api/stream`）経由。**アプリの利用には dev server（`pnpm dev`）または preview server が必要。**
+
+- `LIBSQL_URL` / `LIBSQL_AUTH_TOKEN` を設定すると Turso など外部の libsql に切替できる。ただし変更通知は同一プロセス内の書き込みしか拾わないため、外部から直接 DB に書いた変更をブラウザへ即時反映するにはポーリング等の追加実装が必要（将来課題）
+- 旧 localStorage 形式のデータは、サーバー DB が空のとき初回ページ表示時に一度だけ自動インポートされる（localStorage 側は消さない）
+
+## MCP サーバー
+
+dev server が `http://localhost:3210/mcp` に MCP エンドポイント（streamable HTTP）をホストする。Claude Code からの登録:
+
+```bash
+claude mcp add --transport http tanstack-spreadsheet http://localhost:3210/mcp
+```
+
+ツール:
+
+| tool           | 説明                                                             |
+| -------------- | ---------------------------------------------------------------- |
+| `get_cell`     | セル 1 つの raw と評価値を取得                                   |
+| `get_range`    | `"A1:C10"` 形式の範囲を 2 次元配列で取得                         |
+| `set_cells`    | セルの一括書き込み（`raw: ""` で削除）。開いているタブに即時反映 |
+| `get_snapshot` | 全非空セルの一覧（エクスポート向き）                             |
+
+行・列の挿入・削除などの構造操作ツールは未実装（第 2 段の予定）。
+
 # Building For Production
 
 To build this application for production:

@@ -1,4 +1,7 @@
-import { createCollection, localStorageCollectionOptions } from "@tanstack/react-db";
+import { createCollection } from "@tanstack/react-db";
+
+import { migrateLocalStorageOnce } from "#/db-collections/migrate-local-storage";
+import { subscribeServerSync } from "#/db-collections/server-sync";
 
 export type Cell = {
   /** "A1" style cell id */
@@ -7,14 +10,57 @@ export type Cell = {
   raw: string;
 };
 
-// localStorage collection: persists across reloads and syncs across tabs
-// via storage events. Falls back to in-memory storage during SSR.
-export const cellsCollection = createCollection(
-  localStorageCollectionOptions<Cell>({
-    storageKey: "tanstack-spreadsheet.cells",
-    getKey: (cell) => cell.id,
-  }),
-);
+async function postMutations(cells: ReadonlyArray<Cell>) {
+  const res = await fetch("/api/cells/mutations", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cells }),
+  });
+  if (!res.ok) throw new Error(`cell mutation failed: ${res.status}`);
+}
+
+// Server-synced collection: the dev server's SQLite DB is the source of truth.
+// Local writes apply optimistically, persist via POST, and every tab receives
+// committed changes over the shared SSE stream (which also carries writes made
+// through the MCP endpoint). During SSR the collection just starts empty.
+export const cellsCollection = createCollection<Cell>({
+  id: "cells",
+  getKey: (cell) => cell.id,
+  sync: {
+    sync: ({ begin, write, commit, markReady, truncate }) => {
+      if (typeof window === "undefined") {
+        markReady();
+        return;
+      }
+      return subscribeServerSync({
+        onSnapshot: (snapshot) => {
+          begin();
+          truncate();
+          for (const cell of snapshot.cells) {
+            write({ type: "insert", value: { id: cell.id, raw: cell.raw } });
+          }
+          commit();
+          markReady();
+          void migrateLocalStorageOnce(snapshot);
+        },
+        onCellChanges: (changes) => {
+          begin();
+          for (const change of changes) {
+            if (change.type === "delete") write({ type: "delete", key: change.id });
+            else write({ type: change.type, value: { id: change.id, raw: change.raw } });
+          }
+          commit();
+        },
+      });
+    },
+  },
+  onInsert: ({ transaction }) =>
+    postMutations(transaction.mutations.map((m) => ({ id: m.modified.id, raw: m.modified.raw }))),
+  onUpdate: ({ transaction }) =>
+    postMutations(transaction.mutations.map((m) => ({ id: m.modified.id, raw: m.modified.raw }))),
+  onDelete: ({ transaction }) =>
+    postMutations(transaction.mutations.map((m) => ({ id: String(m.key), raw: "" }))),
+});
 
 /**
  * Diff the collection against a full target state and apply the difference.

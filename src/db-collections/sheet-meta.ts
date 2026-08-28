@@ -1,35 +1,34 @@
-import { createCollection, localStorageCollectionOptions } from "@tanstack/react-db";
+// Column widths, persisted in the dev server's SQLite DB (see server/db.ts).
+// Unlike cells there is no react-db collection here — the widths document is a
+// single object owned by the columnSizingAtom, so plain fetches plus the shared
+// SSE stream (for cross-tab / MCP updates) are enough. The server drops
+// identical writes, which is what terminates the persist→SSE→persist echo.
 
-export type SheetMeta = {
-  /** single document collection; the only id is "grid" */
-  id: string;
-  /** column widths in px, keyed by column label ("A", "B", ...) */
-  widths: Record<string, number>;
-};
+import { subscribeServerSync } from "#/db-collections/server-sync";
+import { columnSizingAtom } from "#/lib/sheet-store";
 
-const GRID_ID = "grid";
-
-export const sheetMetaCollection = createCollection(
-  localStorageCollectionOptions<SheetMeta>({
-    storageKey: "tanstack-spreadsheet.meta",
-    getKey: (meta) => meta.id,
-  }),
-);
-
-/** Resolves with the persisted column widths once the collection has loaded. */
+/** Resolves with the persisted column widths (empty during SSR). */
 export async function loadPersistedWidths(): Promise<Record<string, number>> {
-  const all = await sheetMetaCollection.toArrayWhenReady();
-  return all.find((m) => m.id === GRID_ID)?.widths ?? {};
+  if (typeof window === "undefined") return {};
+  try {
+    const res = await fetch("/api/meta");
+    if (!res.ok) return {};
+    const body = (await res.json()) as { widths?: Record<string, number> };
+    return body.widths ?? {};
+  } catch {
+    return {};
+  }
 }
 
 export function persistWidths(widths: Record<string, number>) {
-  if (sheetMetaCollection.has(GRID_ID)) {
-    sheetMetaCollection.update(GRID_ID, (draft) => {
-      draft.widths = widths;
-    });
-  } else {
-    sheetMetaCollection.insert({ id: GRID_ID, widths });
-  }
+  if (typeof window === "undefined") return;
+  void fetch("/api/meta", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ widths }),
+  }).catch((error: unknown) => {
+    console.warn("[sheet-meta] persisting widths failed:", error);
+  });
 }
 
 let persistTimer: ReturnType<typeof setTimeout> | undefined;
@@ -38,4 +37,20 @@ let persistTimer: ReturnType<typeof setTimeout> | undefined;
 export function persistWidthsDebounced(widths: Record<string, number>) {
   clearTimeout(persistTimer);
   persistTimer = setTimeout(() => persistWidths(widths), 300);
+}
+
+// Follow width changes committed elsewhere (another tab, the MCP endpoint).
+// Snapshots also carry widths so a reconnect can't miss changes made while
+// the stream was down.
+function applyRemoteWidths(widths: Record<string, number>) {
+  if (JSON.stringify(columnSizingAtom.get()) !== JSON.stringify(widths)) {
+    columnSizingAtom.set(widths);
+  }
+}
+
+if (typeof window !== "undefined") {
+  subscribeServerSync({
+    onSnapshot: (snapshot) => applyRemoteWidths(snapshot.widths),
+    onWidths: applyRemoteWidths,
+  });
 }

@@ -13,7 +13,9 @@ pnpm dev
 
 ## データの保存先
 
-スプレッドシートのデータ（セル・列幅）の SSoT は dev server 内の SQLite（libsql）で、既定では `data/spreadsheet.db`（gitignore 済み）に保存される。ブラウザ側の collection はカスタム sync によるミラーで、タブ間同期は SSE（`/api/stream`）経由。**アプリの利用には dev server（`pnpm dev`）または preview server が必要。**
+スプレッドシートのデータ（シート・セル・列幅）の SSoT は dev server 内の SQLite（libsql）で、既定では `data/spreadsheet.db`（gitignore 済み）に保存される。ブラウザ側の collection はカスタム sync によるミラー（シートごとに 1 collection）で、タブ間同期は SSE（`/api/stream`）経由。**アプリの利用には dev server（`pnpm dev`）または preview server が必要。**
+
+複数シートに対応しており、画面下部のタブバーから作成・切替・リネーム・削除できる。シート一覧はサーバーの `sheets` テーブルが正本で、既存の単一シート DB は初回起動時に「シート1」として引き継がれる。ソート・フィルタ・undo 履歴・アクティブシートはタブローカル（シート別）。
 
 - `LIBSQL_URL` / `LIBSQL_AUTH_TOKEN` を設定すると Turso など外部の libsql に切替できる。ただし変更通知は同一プロセス内の書き込みしか拾わないため、外部から直接 DB に書いた変更をブラウザへ即時反映するにはポーリング等の追加実装が必要（将来課題）
 - 旧 localStorage 形式のデータは、サーバー DB が空のとき初回ページ表示時に一度だけ自動インポートされる（localStorage 側は消さない）
@@ -34,6 +36,10 @@ claude mcp add --transport http tanstack-spreadsheet http://localhost:3210/mcp
 | `get_range`    | `"A1:C10"` 形式の範囲を 2 次元配列で取得                         |
 | `set_cells`    | セルの一括書き込み（`raw: ""` で削除）。開いているタブに即時反映 |
 | `get_snapshot` | 全非空セルの一覧（エクスポート向き）                             |
+| `list_sheets`  | 全シートの `{id, name}` 一覧（作成順）                           |
+| `add_sheet`    | シート作成（name 省略時は「シート{N}」を自動採番）               |
+
+セルを扱う 4 ツールは optional な `sheet` パラメータを取る（シート id または名前で指定、省略時は先頭のシート）。存在しないシートへの書き込みはエラーになる（暗黙作成はしない — 先に `add_sheet`）。
 
 行・列の挿入・削除などの構造操作ツールは未実装（第 2 段の予定）。
 

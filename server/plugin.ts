@@ -1,10 +1,14 @@
 // Vite plugin hosting the whole server side of the spreadsheet:
-//   GET  /api/cells            cell snapshot
-//   POST /api/cells/mutations  batch cell writes (raw "" = delete)
-//   GET  /api/meta             column widths
-//   POST /api/meta             persist column widths
-//   GET  /api/stream           SSE: initial snapshot, then change batches
-//   ALL  /mcp                  MCP endpoint (streamable HTTP, stateless)
+//   GET    /api/cells?sheet=          cell snapshot for one sheet
+//   POST   /api/cells/mutations       batch cell writes (raw "" = delete), body carries `sheet`
+//   GET    /api/meta?sheet=           column widths for one sheet
+//   POST   /api/meta                  persist column widths, body carries `sheet`
+//   GET    /api/sheets                sheet list
+//   POST   /api/sheets                create a sheet ({name?})
+//   PATCH  /api/sheets/:id            rename a sheet ({name})
+//   DELETE /api/sheets/:id            delete a sheet and its data
+//   GET    /api/stream                SSE: all-sheet snapshot, then change batches
+//   ALL    /mcp                       MCP endpoint (streamable HTTP, stateless)
 //
 // Everything lives in one plugin on purpose: the Start server routes run in a
 // separate module graph, so splitting the pieces would duplicate the db module
@@ -16,9 +20,21 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 
 import { cellId, parseCellId } from "../src/lib/columns";
 import { displayValue } from "../src/lib/formula";
-import { applyCellMutations, dbEvents, getCells, getWidths, setWidths } from "./db";
+import {
+  DEFAULT_SHEET,
+  applyCellMutations,
+  createSheet,
+  dbEvents,
+  deleteSheet,
+  getCells,
+  getSheets,
+  getWidths,
+  renameSheet,
+  setWidths,
+  sheetExists,
+} from "./db";
 
-import type { CellRow } from "./db";
+import type { CellRow, Sheet, SheetOpError } from "./db";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
@@ -47,6 +63,19 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }
+
+/** Sheet id from a POST body's optional `sheet` field. */
+function sheetOf(body: unknown): string {
+  const sheet = (body as { sheet?: unknown } | null)?.sheet;
+  return typeof sheet === "string" ? sheet : DEFAULT_SHEET;
+}
+
+const SHEET_OP_STATUS: Record<SheetOpError, number> = {
+  "invalid-name": 400,
+  "duplicate-name": 409,
+  "unknown-sheet": 404,
+  "last-sheet": 400,
+};
 
 /** Parse and validate a mutation payload; returns null when malformed. */
 function parseMutationPayload(body: unknown): Array<CellRow> | null {
@@ -80,11 +109,11 @@ function toolError(message: string): ToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-async function evaluatedCells(): Promise<{
+async function evaluatedCells(sheet: string): Promise<{
   rawById: Map<string, string>;
   valueOf: (id: string) => string;
 }> {
-  const rows = await getCells();
+  const rows = await getCells(sheet);
   const rawById = new Map(rows.map((row) => [row.id, row.raw]));
   const getRaw = (id: string) => rawById.get(id);
   return {
@@ -93,6 +122,30 @@ async function evaluatedCells(): Promise<{
   };
 }
 
+/**
+ * Resolve a tool's optional `sheet` argument to a sheet id: exact id match
+ * first, then exact (unique) name match. Omitted → the first sheet, which is
+ * the historical default sheet until someone deletes it.
+ */
+async function resolveSheet(input: unknown): Promise<{ id: string } | { error: string }> {
+  const sheets = await getSheets();
+  if (input === undefined) {
+    const first = sheets[0];
+    return first ? { id: first.id } : { error: "no sheets exist" };
+  }
+  if (typeof input !== "string" || input.trim() === "") {
+    return { error: `invalid sheet: ${String(input)}` };
+  }
+  const match = sheets.find((s) => s.id === input) ?? sheets.find((s) => s.name === input);
+  return match ? { id: match.id } : { error: `unknown sheet: ${input}` };
+}
+
+const SHEET_PROPERTY = {
+  type: "string",
+  description:
+    'Sheet id or sheet name (see list_sheets). Omitted: the first sheet ("シート1" unless renamed).',
+};
+
 const TOOLS = [
   {
     name: "get_cell",
@@ -100,7 +153,10 @@ const TOOLS = [
       'Read a single cell by "A1"-style id. Returns the raw input (formulas keep their leading "=") and the evaluated display value. Unset cells return raw: null and value: "".',
     inputSchema: {
       type: "object",
-      properties: { id: { type: "string", description: 'Cell id, e.g. "A1"' } },
+      properties: {
+        id: { type: "string", description: 'Cell id, e.g. "A1"' },
+        sheet: SHEET_PROPERTY,
+      },
       required: ["id"],
     },
   },
@@ -110,7 +166,10 @@ const TOOLS = [
       'Read a rectangular range like "A1:C10" (a single cell id also works). Returns a row-major 2D array of {id, raw, value}.',
     inputSchema: {
       type: "object",
-      properties: { range: { type: "string", description: 'Range, e.g. "A1:C10"' } },
+      properties: {
+        range: { type: "string", description: 'Range, e.g. "A1:C10"' },
+        sheet: SHEET_PROPERTY,
+      },
       required: ["range"],
     },
   },
@@ -132,6 +191,7 @@ const TOOLS = [
             required: ["id", "raw"],
           },
         },
+        sheet: SHEET_PROPERTY,
       },
       required: ["cells"],
     },
@@ -139,21 +199,50 @@ const TOOLS = [
   {
     name: "get_snapshot",
     description:
-      "List every non-empty cell with its raw input and evaluated value. Useful as a full export of the sheet.",
+      "List every non-empty cell of one sheet with its raw input and evaluated value. Useful as a full export of the sheet.",
+    inputSchema: { type: "object", properties: { sheet: SHEET_PROPERTY } },
+  },
+  {
+    name: "list_sheets",
+    description:
+      "List all sheets as {id, name} in creation order. Sheet ids are stable; names are unique and user-editable.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "add_sheet",
+    description:
+      'Create a new sheet. Without a name the next free "シート{N}" is used. Fails if the name is already taken.',
+    inputSchema: {
+      type: "object",
+      properties: { name: { type: "string", description: "Sheet name (must be unique)" } },
+    },
   },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
   switch (name) {
+    case "list_sheets":
+      return toolJson({ sheets: await getSheets() });
+    case "add_sheet": {
+      if (args.name !== undefined && typeof args.name !== "string") {
+        return toolError(`invalid sheet name: ${String(args.name)}`);
+      }
+      const result = await createSheet(args.name);
+      if (!result.ok) return toolError(`could not create sheet: ${result.error}`);
+      return toolJson({ sheet: result.sheet });
+    }
     case "get_cell": {
+      const sheet = await resolveSheet(args.sheet);
+      if ("error" in sheet) return toolError(sheet.error);
       const id = typeof args.id === "string" ? args.id.trim().toUpperCase() : "";
       if (!parseCellId(id)) return toolError(`invalid cell id: ${String(args.id)}`);
-      const { rawById, valueOf } = await evaluatedCells();
+      const { rawById, valueOf } = await evaluatedCells(sheet.id);
       const raw = rawById.get(id);
       return toolJson({ id, raw: raw ?? null, value: raw === undefined ? "" : valueOf(id) });
     }
     case "get_range": {
+      const sheet = await resolveSheet(args.sheet);
+      if ("error" in sheet) return toolError(sheet.error);
       const input = typeof args.range === "string" ? args.range.trim().toUpperCase() : "";
       const [startId, endId = startId] = input.split(":", 2);
       const start = parseCellId(startId ?? "");
@@ -168,7 +257,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<To
       if (size > MAX_RANGE_CELLS) {
         return toolError(`range too large: ${size} cells (max ${MAX_RANGE_CELLS})`);
       }
-      const { rawById, valueOf } = await evaluatedCells();
+      const { rawById, valueOf } = await evaluatedCells(sheet.id);
       const grid: Array<Array<{ id: string; raw: string | null; value: string }>> = [];
       for (let r = rows[0]; r <= rows[1]; r++) {
         const row: Array<{ id: string; raw: string | null; value: string }> = [];
@@ -182,17 +271,21 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<To
       return toolJson({ range: input, rows: grid });
     }
     case "set_cells": {
+      const sheet = await resolveSheet(args.sheet);
+      if ("error" in sheet) return toolError(sheet.error);
       const cells = parseMutationPayload({ cells: args.cells });
       if (!cells) {
         return toolError(
           'invalid cells payload: expected [{id: "A1", raw: "..."}] with valid cell ids',
         );
       }
-      const changes = await applyCellMutations(cells);
+      const changes = await applyCellMutations(cells, sheet.id);
       return toolJson({ applied: changes.length });
     }
     case "get_snapshot": {
-      const { rawById, valueOf } = await evaluatedCells();
+      const sheet = await resolveSheet(args.sheet);
+      if ("error" in sheet) return toolError(sheet.error);
+      const { rawById, valueOf } = await evaluatedCells(sheet.id);
       const cells = [...rawById.entries()]
         .toSorted(([a], [b]) => a.localeCompare(b))
         .map(([id, raw]) => ({ id, raw, value: valueOf(id) }));
@@ -241,65 +334,132 @@ async function handleStream(req: IncomingMessage, res: ServerResponse) {
     "cache-control": "no-cache",
     connection: "keep-alive",
   });
-  const [cells, widths] = await Promise.all([getCells(), getWidths()]);
-  sendEvent(res, "snapshot", { cells, widths });
+  // Whole-DB snapshot: the EventSource auto-reconnect relies on this resend to
+  // resync every per-sheet collection over the single shared stream.
+  const sheets = await getSheets();
+  const bySheet: Record<string, { cells: Array<CellRow>; widths: Record<string, number> }> = {};
+  for (const sheet of sheets) {
+    const [cells, widths] = await Promise.all([getCells(sheet.id), getWidths(sheet.id)]);
+    bySheet[sheet.id] = { cells, widths };
+  }
+  sendEvent(res, "snapshot", { sheets, bySheet });
 
-  const onCells = (_sheet: string, changes: unknown) => sendEvent(res, "cells", { changes });
-  const onMeta = (_sheet: string, nextWidths: unknown) =>
-    sendEvent(res, "meta", { widths: nextWidths });
+  const onCells = (sheet: string, changes: unknown) => sendEvent(res, "cells", { sheet, changes });
+  const onMeta = (sheet: string, nextWidths: unknown) =>
+    sendEvent(res, "meta", { sheet, widths: nextWidths });
+  const onSheets = (nextSheets: Array<Sheet>) => sendEvent(res, "sheets", { sheets: nextSheets });
   dbEvents.on("cells", onCells);
   dbEvents.on("meta", onMeta);
+  dbEvents.on("sheets", onSheets);
   const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 30_000);
   req.on("close", () => {
     clearInterval(keepAlive);
     dbEvents.off("cells", onCells);
     dbEvents.off("meta", onMeta);
+    dbEvents.off("sheets", onSheets);
   });
 }
 
 // --- plugin ------------------------------------------------------------------
 
+/** Reply 404 unless the sheet exists; true means the caller may proceed. */
+async function requireSheet(res: ServerResponse, sheet: string): Promise<boolean> {
+  if (await sheetExists(sheet)) return true;
+  sendJson(res, 404, { error: `unknown sheet: ${sheet}` });
+  return false;
+}
+
+function sendSheetOpError(res: ServerResponse, error: SheetOpError) {
+  sendJson(res, SHEET_OP_STATUS[error], { error });
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const url = (req.url ?? "").split("?")[0];
+  const { pathname, searchParams } = new URL(req.url ?? "", "http://localhost");
   const method = req.method ?? "GET";
 
-  if (url === "/mcp") {
+  if (pathname === "/mcp") {
     await handleMcp(req, res);
     return true;
   }
-  if (url === "/api/stream" && method === "GET") {
+  if (pathname === "/api/stream" && method === "GET") {
     await handleStream(req, res);
     return true;
   }
-  if (url === "/api/cells" && method === "GET") {
-    sendJson(res, 200, { cells: await getCells() });
+  if (pathname === "/api/cells" && method === "GET") {
+    const sheet = searchParams.get("sheet") ?? DEFAULT_SHEET;
+    if (!(await requireSheet(res, sheet))) return true;
+    sendJson(res, 200, { cells: await getCells(sheet) });
     return true;
   }
-  if (url === "/api/cells/mutations" && method === "POST") {
+  if (pathname === "/api/cells/mutations" && method === "POST") {
     const body = await readBody(req).catch(() => null);
     const cells = body === null ? null : parseMutationPayload(body);
     if (!cells) {
       sendJson(res, 400, { error: "invalid mutation payload" });
       return true;
     }
-    const changes = await applyCellMutations(cells);
+    const sheet = sheetOf(body);
+    if (!(await requireSheet(res, sheet))) return true;
+    const changes = await applyCellMutations(cells, sheet);
     sendJson(res, 200, { applied: changes.length });
     return true;
   }
-  if (url === "/api/meta" && method === "GET") {
-    sendJson(res, 200, { widths: await getWidths() });
+  if (pathname === "/api/meta" && method === "GET") {
+    const sheet = searchParams.get("sheet") ?? DEFAULT_SHEET;
+    if (!(await requireSheet(res, sheet))) return true;
+    sendJson(res, 200, { widths: await getWidths(sheet) });
     return true;
   }
-  if (url === "/api/meta" && method === "POST") {
-    const body = (await readBody(req).catch(() => null)) as { widths?: unknown } | null;
+  if (pathname === "/api/meta" && method === "POST") {
+    const body = (await readBody(req).catch(() => null)) as {
+      widths?: unknown;
+      sheet?: unknown;
+    } | null;
     const widths = body?.widths;
     if (widths === null || typeof widths !== "object" || Array.isArray(widths)) {
       sendJson(res, 400, { error: "invalid widths payload" });
       return true;
     }
-    await setWidths(widths as Record<string, number>);
+    const sheet = sheetOf(body);
+    if (!(await requireSheet(res, sheet))) return true;
+    await setWidths(widths as Record<string, number>, sheet);
     sendJson(res, 200, { ok: true });
     return true;
+  }
+  if (pathname === "/api/sheets" && method === "GET") {
+    sendJson(res, 200, { sheets: await getSheets() });
+    return true;
+  }
+  if (pathname === "/api/sheets" && method === "POST") {
+    const body = (await readBody(req).catch(() => null)) as { name?: unknown } | null;
+    if (body?.name !== undefined && typeof body.name !== "string") {
+      sendJson(res, 400, { error: "invalid sheet name" });
+      return true;
+    }
+    const result = await createSheet(body?.name);
+    if (!result.ok) sendSheetOpError(res, result.error);
+    else sendJson(res, 200, { sheet: result.sheet });
+    return true;
+  }
+  if (pathname.startsWith("/api/sheets/")) {
+    const id = decodeURIComponent(pathname.slice("/api/sheets/".length));
+    if (method === "PATCH") {
+      const body = (await readBody(req).catch(() => null)) as { name?: unknown } | null;
+      if (typeof body?.name !== "string") {
+        sendJson(res, 400, { error: "invalid sheet name" });
+        return true;
+      }
+      const result = await renameSheet(id, body.name);
+      if (!result.ok) sendSheetOpError(res, result.error);
+      else sendJson(res, 200, { sheet: result.sheet });
+      return true;
+    }
+    if (method === "DELETE") {
+      const result = await deleteSheet(id);
+      if (!result.ok) sendSheetOpError(res, result.error);
+      else sendJson(res, 200, { ok: true });
+      return true;
+    }
   }
   return false;
 }

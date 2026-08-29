@@ -2,6 +2,7 @@ import { Store, createAtom } from "@tanstack/store";
 
 import { cellId, columnLabel, labelToColumnIndex } from "#/lib/columns";
 
+import type { SheetInfo } from "#/db-collections/server-sync";
 import type {
   CellSelectionRange,
   CellSelectionState,
@@ -12,6 +13,9 @@ import type {
 
 export const INITIAL_COLS = 26;
 export const INITIAL_ROWS = 50;
+
+/** Sheet id the server seeds for a fresh / pre-multi-sheet DB. */
+export const DEFAULT_SHEET_ID = "default";
 
 export type EditingState = {
   cellId: string;
@@ -33,6 +37,51 @@ export const sheetStore = new Store<SheetState>({
   cols: INITIAL_COLS,
   rows: INITIAL_ROWS,
 });
+
+// --- sheets ------------------------------------------------------------------
+// The sheet list mirrors the server (via the shared SSE stream); the active
+// sheet id is tab-local and only remembered across reloads, not synced live
+// (another tab switching sheets must not drag this one along).
+
+const ACTIVE_SHEET_KEY = "tanstack-spreadsheet.activeSheet";
+
+function loadActiveSheetId(): string {
+  if (typeof window === "undefined") return DEFAULT_SHEET_ID;
+  try {
+    return localStorage.getItem(ACTIVE_SHEET_KEY) ?? DEFAULT_SHEET_ID;
+  } catch {
+    return DEFAULT_SHEET_ID;
+  }
+}
+
+export const sheetsAtom = createAtom<Array<SheetInfo>>([]);
+export const activeSheetIdAtom = createAtom<string>(loadActiveSheetId());
+
+// rows/cols are session state (recovered from cells via ensureFits), so a
+// sheet keeps its grid size while the tab lives but not across reloads
+const gridSizeBySheet = new Map<string, { rows: number; cols: number }>();
+
+/** Switch the active sheet: park this sheet's grid size, reset per-sheet UI
+ * state (editing, selection, view), and remount the grid via the atom. */
+export function switchSheet(id: string) {
+  const current = activeSheetIdAtom.get();
+  if (id === current) return;
+  gridSizeBySheet.set(current, { rows: sheetStore.state.rows, cols: sheetStore.state.cols });
+  stopEditing();
+  cellSelectionAtom.set([collapsedRange(0, 1)]);
+  const saved = gridSizeBySheet.get(id);
+  sheetStore.setState((s) => ({
+    ...s,
+    rows: saved?.rows ?? INITIAL_ROWS,
+    cols: saved?.cols ?? INITIAL_COLS,
+  }));
+  activeSheetIdAtom.set(id);
+  try {
+    localStorage.setItem(ACTIVE_SHEET_KEY, id);
+  } catch {
+    // storage unavailable — the active sheet just won't survive reloads
+  }
+}
 
 // --- selection ---------------------------------------------------------------
 // The table's cellSelection slice is owned by this atom (v9 external-atom
@@ -123,37 +172,54 @@ export function clearViewState() {
   columnFiltersAtom.set([]);
 }
 
-const VIEW_STATE_KEY = "tanstack-spreadsheet.view";
+const LEGACY_VIEW_STATE_KEY = "tanstack-spreadsheet.view";
+
+function viewStateKey(sheetId: string) {
+  return `tanstack-spreadsheet.view:${sheetId}`;
+}
 
 type PersistedViewState = { sorting: SortingState; columnFilters: ColumnFiltersState };
 
-export function loadPersistedViewState(): PersistedViewState | null {
+function parseViewState(raw: string | null): PersistedViewState | null {
+  if (!raw) return null;
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const { sorting, columnFilters } = parsed as Partial<PersistedViewState>;
+  return {
+    sorting: Array.isArray(sorting) ? sorting : [],
+    columnFilters: Array.isArray(columnFilters) ? columnFilters : [],
+  };
+}
+
+export function loadPersistedViewState(sheetId: string): PersistedViewState | null {
   try {
-    const raw = localStorage.getItem(VIEW_STATE_KEY);
-    if (!raw) return null;
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null) return null;
-    const { sorting, columnFilters } = parsed as Partial<PersistedViewState>;
-    return {
-      sorting: Array.isArray(sorting) ? sorting : [],
-      columnFilters: Array.isArray(columnFilters) ? columnFilters : [],
-    };
+    const state = parseViewState(localStorage.getItem(viewStateKey(sheetId)));
+    if (state) return state;
+    // pre-multi-sheet installs saved a single sheet-less view; treat it as the
+    // default sheet's until the first per-sheet persist replaces it
+    if (sheetId === DEFAULT_SHEET_ID) {
+      return parseViewState(localStorage.getItem(LEGACY_VIEW_STATE_KEY));
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-export function persistViewState() {
+export function persistViewState(sheetId: string) {
   try {
     const state: PersistedViewState = {
       sorting: sortingAtom.get(),
       columnFilters: columnFiltersAtom.get(),
     };
     if (state.sorting.length === 0 && state.columnFilters.length === 0) {
-      localStorage.removeItem(VIEW_STATE_KEY);
+      localStorage.removeItem(viewStateKey(sheetId));
     } else {
-      localStorage.setItem(VIEW_STATE_KEY, JSON.stringify(state));
+      localStorage.setItem(viewStateKey(sheetId), JSON.stringify(state));
     }
+    // the per-sheet key now owns this sheet's view; drop the legacy key so a
+    // cleared view cannot resurrect from it on the next load
+    if (sheetId === DEFAULT_SHEET_ID) localStorage.removeItem(LEGACY_VIEW_STATE_KEY);
   } catch {
     // storage unavailable (private mode etc.) — the view just won't survive reloads
   }

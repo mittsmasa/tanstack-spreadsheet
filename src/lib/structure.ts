@@ -7,13 +7,14 @@
 // against the full target state (applyCellsDiff) so the same key is never
 // deleted and reinserted in one batch.
 
-import { applyCellsDiff, cellsCollection } from "#/db-collections/cells";
+import { activeCells, applyCellsDiff } from "#/db-collections/cells";
 import { persistWidths } from "#/db-collections/sheet-meta";
 import { cellId, columnLabel, labelToColumnIndex, parseCellId } from "#/lib/columns";
 import { rewriteFormulaRefs } from "#/lib/formula";
 import { recordHistory } from "#/lib/history";
 import {
   activeCellPos,
+  activeSheetIdAtom,
   cellSelectionAtom,
   columnSizingAtom,
   setActiveCell,
@@ -63,7 +64,7 @@ function blockMoveMap(srcStart: number, srcEnd: number, dest: number): IndexMap 
 
 function remapCells(mapCol: IndexMap, mapRow: IndexMap) {
   const target: Array<Cell> = [];
-  for (const cell of cellsCollection.toArray) {
+  for (const cell of activeCells().toArray) {
     const pos = parseCellId(cell.id);
     if (!pos) continue;
     const newCol = mapCol(pos.colIndex);
@@ -90,7 +91,7 @@ function remapWidths(mapCol: IndexMap) {
     if (mapped !== null) next[columnLabel(mapped)] = width;
   }
   columnSizingAtom.set(next);
-  persistWidths(next);
+  persistWidths(next, activeSheetIdAtom.get());
 }
 
 /** Delete rows (1-based). Refuses to delete every row. */

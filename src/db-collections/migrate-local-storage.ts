@@ -6,7 +6,7 @@
 // When the server is still empty and legacy data exists, push it up once.
 // The localStorage keys are left untouched so nothing is lost if this fails.
 
-import type { Snapshot } from "#/db-collections/server-sync";
+import type { SheetData } from "#/db-collections/server-sync";
 
 const LEGACY_CELLS_KEY = "tanstack-spreadsheet.cells";
 const LEGACY_META_KEY = "tanstack-spreadsheet.meta";
@@ -25,7 +25,10 @@ function legacyEntries(storageKey: string): Array<unknown> {
     .map(([, value]) => (value as { data?: unknown }).data);
 }
 
-export async function migrateLocalStorageOnce(snapshot: Snapshot): Promise<void> {
+// Legacy data predates multi-sheet, so it always belongs to the default sheet
+// (the caller only invokes this for the default sheet's snapshot; the missing
+// `sheet` field in the POST bodies below resolves to 'default' server-side).
+export async function migrateLocalStorageOnce(snapshot: SheetData): Promise<void> {
   if (attempted) return;
   attempted = true;
   try {

@@ -48,6 +48,7 @@ import {
   moveColumns,
   moveRows,
 } from "#/lib/structure";
+import { encodeTsv, parseTsv } from "#/lib/tsv";
 
 import type { GetRaw } from "#/lib/formula";
 import type {
@@ -245,9 +246,13 @@ function CellEditor({ id, initial }: { id: string; initial: string }) {
   };
 
   return (
-    <input
-      className="absolute inset-0 h-full w-full border-2 border-[var(--palm)] bg-[var(--surface-strong)] px-1.5 font-mono text-[13px] text-[var(--sea-ink)] outline-none"
+    // 行数に応じて下方向に伸び、編集中だけ下のセルに重なる（1 行なら 26px で現状どおり）。
+    // z-[1] は後続行の CellView (relative, z-auto) より手前、sticky ヘッダ (z-10/20/30) より奥
+    <textarea
+      className="absolute inset-x-0 top-0 z-[1] min-h-full w-full resize-none overflow-hidden border-2 border-[var(--palm)] bg-[var(--surface-strong)] px-1.5 font-mono text-[13px] leading-[22px] text-[var(--sea-ink)] outline-none"
       value={value}
+      rows={value.split("\n").length}
+      wrap="off"
       autoFocus
       onFocus={(e) => {
         const len = e.currentTarget.value.length;
@@ -258,7 +263,24 @@ function CellEditor({ id, initial }: { id: string; initial: string }) {
       onDoubleClick={(e) => e.stopPropagation()}
       onBlur={() => commit(0, 0)}
       onKeyDown={(e) => {
+        // IME 変換確定の Enter/Tab/Escape を編集操作として扱わない
+        // (Safari は compositionend 直後も keyCode 229 が残ることがある)
+        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
         if (e.key === "Enter") {
+          if (e.altKey || e.shiftKey) {
+            // Alt+Enter は既定では改行にならないブラウザがあるため明示的に挿入する。
+            // setRangeText 後の state が DOM 値と一致するので再レンダーでカーソルは動かない
+            e.preventDefault();
+            const el = e.currentTarget;
+            el.setRangeText(
+              "\n",
+              el.selectionStart ?? el.value.length,
+              el.selectionEnd ?? el.value.length,
+              "end",
+            );
+            setValue(el.value);
+            return;
+          }
           e.preventDefault();
           commit(0, 1);
         } else if (e.key === "Tab") {
@@ -301,6 +323,8 @@ const CellView = memo(function CellView({
 
   const isError = display === ERROR_VALUE || display === REF_ERROR_VALUE;
   const isNumeric = !isError && display !== "" && !Number.isNaN(Number(display));
+  // 複数行の値は 1 行目だけ見せて、続きがあることを ⏎ で示す（行高 26px は維持）
+  const newlineIndex = display.indexOf("\n");
 
   // range outline: paint only the outer edges of the selection
   const edgeShadows: Array<string> = [];
@@ -332,7 +356,15 @@ const CellView = memo(function CellView({
       onMouseEnter={(e) => cell.getSelectionExtendHandler()(e)}
       onDoubleClick={() => startEditing(id)}
     >
-      <span className="block overflow-hidden text-ellipsis whitespace-nowrap">{display}</span>
+      <span className="flex items-baseline">
+        <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+          {newlineIndex === -1 ? display : display.slice(0, newlineIndex)}
+        </span>
+        {newlineIndex !== -1 && (
+          // shrink-0 で、1 行目が ellipsis で切り詰められても目印は常に見せる
+          <span className="ml-1 shrink-0 text-[10px] text-[var(--sea-ink-soft)]">⏎</span>
+        )}
+      </span>
       {isEditing && <CellEditor id={id} initial={seed ?? raw ?? ""} />}
     </div>
   );
@@ -355,6 +387,9 @@ function FormulaBar({ selected, raw }: { selected: string; raw: string }) {
         placeholder="値または =A1*2 のような数式"
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={(e) => {
+          // IME 変換確定の Enter/Escape を編集操作として扱わない
+          // (Safari は compositionend 直後も keyCode 229 が残ることがある)
+          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
           if (e.key === "Enter") {
             e.preventDefault();
             setCellWithHistory(selected, value);
@@ -823,7 +858,7 @@ export default function Spreadsheet() {
     if (!bounds) return;
     const leafColumns = table.getAllLeafColumns();
     const modelRows = table.getRowModel().rows;
-    const lines: Array<string> = [];
+    const lines: Array<Array<string>> = [];
     for (let r = bounds.minRowIndex; r <= bounds.maxRowIndex; r++) {
       const rowNumber = Number(modelRows[r]?.id);
       const parts: Array<string> = [];
@@ -832,9 +867,9 @@ export default function Spreadsheet() {
         if (!column || column.id === ROW_HEADER_ID) continue;
         parts.push(Number.isInteger(rowNumber) ? (getRaw(`${column.id}${rowNumber}`) ?? "") : "");
       }
-      lines.push(parts.join("\t"));
+      lines.push(parts);
     }
-    e.clipboardData.setData("text/plain", lines.join("\n"));
+    e.clipboardData.setData("text/plain", encodeTsv(lines));
     e.preventDefault();
   };
 
@@ -843,14 +878,14 @@ export default function Spreadsheet() {
     const text = e.clipboardData?.getData("text/plain");
     if (!text) return;
     e.preventDefault();
-    const lines = text.replace(/\r\n?/g, "\n").split("\n");
-    if (lines[lines.length - 1] === "") lines.pop();
-    if (lines.length === 0) return;
+    const lines = parseTsv(text);
+    // 末尾の改行（Excel コピーの慣例）が生む空行は貼り付け対象にしない
+    const last = lines[lines.length - 1];
+    if (lines.length > 1 && last?.length === 1 && last[0] === "") lines.pop();
     recordHistory();
     const origin = activeCellPos(cellSelectionAtom.get());
     let width = 0;
-    lines.forEach((line, i) => {
-      const values = line.split("\t");
+    lines.forEach((values, i) => {
       width = Math.max(width, values.length);
       values.forEach((value, j) => {
         const colIndex = origin.colIndex + j;

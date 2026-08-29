@@ -3,9 +3,13 @@ import { useLiveQuery } from "@tanstack/react-db";
 import { shallow, useSelector, useStore } from "@tanstack/react-store";
 import {
   cellSelectionFeature,
+  columnFilteringFeature,
   columnResizingFeature,
   columnSizingFeature,
+  createFilteredRowModel,
+  createSortedRowModel,
   flexRender,
+  rowSortingFeature,
   tableFeatures,
   useTable,
 } from "@tanstack/react-table";
@@ -22,11 +26,17 @@ import {
   addColumn,
   addRow,
   cellSelectionAtom,
+  clearViewState,
+  columnFiltersAtom,
   columnSizingAtom,
   ensureFits,
   focusCellIdOf,
+  loadPersistedViewState,
   moveActive,
+  persistViewState,
+  setRowNavigator,
   sheetStore,
+  sortingAtom,
   startEditing,
   stopEditing,
 } from "#/lib/sheet-store";
@@ -45,6 +55,8 @@ import type {
   CellSelectionState,
   Cell as TableCell,
   ColumnDef,
+  FilterFn,
+  SortFn,
   Table,
 } from "@tanstack/react-table";
 
@@ -54,6 +66,10 @@ const features = tableFeatures({
   cellSelectionFeature,
   columnSizingFeature,
   columnResizingFeature,
+  rowSortingFeature,
+  sortedRowModel: createSortedRowModel(),
+  columnFilteringFeature,
+  filteredRowModel: createFilteredRowModel(),
 });
 
 type SheetColumnDef = ColumnDef<typeof features, SheetRow>;
@@ -63,6 +79,46 @@ type SheetCell = TableCell<typeof features, SheetRow, unknown>;
 const ROW_HEADER_ID = "__rowHeader";
 const HEADER_HEIGHT = 26;
 const ROW_HEADER_WIDTH = 48;
+
+// --- sorting / filtering (display-only view state) ---------------------------
+// Data columns expose their evaluated display value via accessorFn (numeric
+// strings become numbers). Both functions below are passed straight to the
+// column defs — v9 needs no registry for directly-passed fns. The built-in
+// auto sort inference samples row values and warns on unregistered names, so
+// an explicit comparator keeps behavior independent of cell contents.
+
+/** Numbers sort numerically before text; text compares locale-aware. */
+function compareCellValues(a: unknown, b: unknown): number {
+  if (typeof a === "number" && typeof b === "number") return a === b ? 0 : a < b ? -1 : 1;
+  if (typeof a === "number") return -1;
+  if (typeof b === "number") return 1;
+  return String(a).localeCompare(String(b), "ja");
+}
+
+const sortFn_cellValues: SortFn<typeof features, SheetRow> = (rowA, rowB, columnId) =>
+  compareCellValues(rowA.getValue(columnId), rowB.getValue(columnId));
+
+/** Case-insensitive substring match over the stringified display value. */
+const filterFn_cellText: FilterFn<typeof features, SheetRow> = (row, columnId, filterValue) =>
+  String(row.getValue(columnId) ?? "")
+    .toLowerCase()
+    .includes(String(filterValue).toLowerCase());
+
+function cycleSort(colId: string) {
+  sortingAtom.set((prev) => {
+    const current = prev.find((s) => s.id === colId);
+    if (!current) return [{ id: colId, desc: false }];
+    if (!current.desc) return [{ id: colId, desc: true }];
+    return [];
+  });
+}
+
+function setColumnFilter(colId: string, value: string) {
+  columnFiltersAtom.set((prev) => {
+    const rest = prev.filter((f) => f.id !== colId);
+    return value === "" ? rest : [...rest, { id: colId, value }];
+  });
+}
 
 const ARROW_DIRECTIONS: Record<string, CellSelectionDirection> = {
   ArrowUp: "up",
@@ -469,6 +525,51 @@ function AutoScrollFollower({ gridRef }: { gridRef: React.RefObject<HTMLDivEleme
   return null;
 }
 
+/** Per-column sort/filter popover, anchored under the column header. */
+function HeaderMenu({ colId }: { colId: string }) {
+  const sorting = useSelector(sortingAtom);
+  const filters = useSelector(columnFiltersAtom);
+  const sortEntry = sorting.find((s) => s.id === colId);
+  const filterValue = String(filters.find((f) => f.id === colId)?.value ?? "");
+  const sortLabel = sortEntry ? (sortEntry.desc ? "降順 ▼" : "昇順 ▲") : "なし";
+
+  return (
+    <div
+      data-header-menu
+      className="absolute left-0 top-full z-40 flex w-48 flex-col gap-2 rounded border border-[var(--line)] bg-[var(--surface-strong)] p-2 text-left font-sans text-xs font-normal text-[var(--sea-ink)] shadow-lg"
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => e.stopPropagation()}
+    >
+      <button
+        type="button"
+        className={toolbarButtonClass}
+        title="クリックで 昇順 → 降順 → 解除 を巡回"
+        onClick={() => cycleSort(colId)}
+      >
+        ソート: {sortLabel}
+      </button>
+      <label className="flex flex-col gap-1">
+        <span className="text-[var(--sea-ink-soft)]">フィルタ（部分一致）</span>
+        <input
+          className="rounded border border-[var(--line)] bg-[var(--surface)] px-1.5 py-0.5 font-mono text-[13px] outline-none focus:border-[var(--palm)]"
+          value={filterValue}
+          autoFocus
+          onChange={(e) => setColumnFilter(colId, e.target.value)}
+        />
+      </label>
+      <button
+        type="button"
+        className={toolbarButtonClass}
+        disabled={filterValue === ""}
+        onClick={() => setColumnFilter(colId, "")}
+      >
+        フィルタ解除
+      </button>
+    </div>
+  );
+}
+
 type DragBlock = { kind: "col" | "row"; start: number; end: number };
 type DropIndicator = { kind: "col" | "row"; insert: number };
 
@@ -491,6 +592,24 @@ export default function Spreadsheet() {
 
   // re-render on width changes so column.getSize() reads fresh values
   useSelector(columnSizingAtom);
+
+  // re-render on view-state changes so getRowModel() reflects sort/filter
+  const sorting = useSelector(sortingAtom);
+  const columnFilters = useSelector(columnFiltersAtom);
+  const viewActive = sorting.length > 0 || columnFilters.length > 0;
+  const [menuColId, setMenuColId] = useState<string | null>(null);
+
+  // close the header menu on any click outside it
+  useEffect(() => {
+    if (menuColId === null) return;
+    const close = (e: MouseEvent) => {
+      if (!(e.target instanceof Element) || !e.target.closest("[data-header-menu]")) {
+        setMenuColId(null);
+      }
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [menuColId]);
 
   // Grow the grid so persisted cells (e.g. an added AA column) stay visible
   // after a reload.
@@ -520,9 +639,30 @@ export default function Spreadsheet() {
     };
   }, []);
 
+  // Restore the sort/filter view once (localStorage, tab-independent), then
+  // keep it saved so a reload comes back with the same view.
+  useEffect(() => {
+    const saved = loadPersistedViewState();
+    if (saved) {
+      if (saved.sorting.length > 0) sortingAtom.set(saved.sorting);
+      if (saved.columnFilters.length > 0) columnFiltersAtom.set(saved.columnFilters);
+    }
+    const subs = [
+      sortingAtom.subscribe(persistViewState),
+      columnFiltersAtom.subscribe(persistViewState),
+    ];
+    return () => {
+      for (const sub of subs) sub.unsubscribe();
+    };
+  }, []);
+
+  // cellMap is a dependency on purpose: row identity is what invalidates the
+  // memoized sorted/filtered row models, so cell edits re-evaluate the view
+  // (accessorFn reads getRaw, which the table cannot track by itself)
   const data = useMemo<Array<SheetRow>>(
     () => Array.from({ length: rows }, (_, i) => ({ rowNumber: i + 1 })),
-    [rows],
+    // oxlint-disable-next-line react/memo-dependencies, react-hooks/exhaustive-deps
+    [rows, cellMap],
   );
 
   const columns = useMemo<Array<SheetColumnDef>>(
@@ -532,6 +672,8 @@ export default function Spreadsheet() {
         size: ROW_HEADER_WIDTH,
         enableResizing: false,
         enableCellSelection: false,
+        enableSorting: false,
+        enableColumnFilter: false,
         header: () => "",
         cell: (info) => info.row.original.rowNumber,
       },
@@ -539,6 +681,21 @@ export default function Spreadsheet() {
         const label = columnLabel(c);
         return {
           id: label,
+          // evaluated display value for sorting/filtering; numeric-looking
+          // values become numbers, empty cells undefined (pushed last)
+          accessorFn: (row) => {
+            const display = displayValue(
+              `${label}${row.rowNumber}`,
+              getRaw(`${label}${row.rowNumber}`),
+              getRaw,
+            );
+            if (display === "") return undefined;
+            const n = Number(display);
+            return Number.isNaN(n) ? display : n;
+          },
+          sortFn: sortFn_cellValues,
+          sortUndefined: "last",
+          filterFn: filterFn_cellText,
           size: 88,
           minSize: 48,
           maxSize: 480,
@@ -569,10 +726,26 @@ export default function Spreadsheet() {
     atoms: {
       cellSelection: cellSelectionAtom,
       columnSizing: columnSizingAtom,
+      sorting: sortingAtom,
+      columnFilters: columnFiltersAtom,
     },
     autoResetCellSelection: false,
     columnResizeMode: "onChange",
   });
+
+  // Vertical moves after an edit commit must follow the view order, or the
+  // active cell walks into rows the current filter hides and the next keystroke
+  // edits an invisible cell.
+  useEffect(() => {
+    setRowNavigator((rowNumber, dRow) => {
+      const visible = table.getRowModel().rows;
+      const index = visible.findIndex((r) => r.original.rowNumber === rowNumber);
+      if (index < 0) return visible[0]?.original.rowNumber ?? rowNumber;
+      const next = visible[Math.min(Math.max(index + dRow, 0), visible.length - 1)];
+      return next?.original.rowNumber ?? rowNumber;
+    });
+    return () => setRowNavigator(null);
+  }, [table]);
 
   const clearSelectedCells = () => {
     const leafColumns = table.getAllLeafColumns();
@@ -699,6 +872,11 @@ export default function Spreadsheet() {
   // --- header drag & drop (move columns / rows) ------------------------------
 
   const startColumnDrag = (colIndex: number, e: React.DragEvent) => {
+    // structural moves are disabled while a sort/filter view is active
+    if (viewActive) {
+      e.preventDefault();
+      return;
+    }
     // a resize grab also starts a native drag of the draggable header
     // (stopPropagation on the handle's mousedown cannot suppress it), so
     // cancel the drag while a resize interaction is open
@@ -718,6 +896,10 @@ export default function Spreadsheet() {
   };
 
   const startRowDrag = (rowNumber: number, e: React.DragEvent) => {
+    if (viewActive) {
+      e.preventDefault();
+      return;
+    }
     const span = fullRowSpan(cellSelectionAtom.get(), sheetStore.state.cols);
     const block =
       span && rowNumber >= span.start && rowNumber <= span.end
@@ -782,6 +964,10 @@ export default function Spreadsheet() {
   const columnInsert = dropIndicator?.kind === "col" ? dropIndicator.insert : null;
   const rowInsert = dropIndicator?.kind === "row" ? dropIndicator.insert : null;
 
+  const sortDirByCol = new Map(sorting.map((s) => [s.id, s.desc ? "desc" : "asc"] as const));
+  const filteredCols = new Set(columnFilters.map((f) => f.id));
+  const visibleRows = table.getRowModel().rows;
+
   /** 2px insertion indicator on the edge a dragged block would land on. */
   const dropIndicatorShadow = (dataColIndex: number, rowNumber: number): string | undefined => {
     const parts: Array<string> = [];
@@ -828,7 +1014,31 @@ export default function Spreadsheet() {
             + 列
           </button>
           <UndoRedoButtons />
-          <StructureToolbar />
+          {viewActive ? (
+            <>
+              <span className="text-xs text-[var(--sea-ink-soft)]">
+                表示:{" "}
+                {[
+                  ...sorting.map((s) => `${s.id} ${s.desc ? "▼" : "▲"}`),
+                  ...(columnFilters.length > 0 ? [`${columnFilters.length} 列フィルタ`] : []),
+                ].join(" · ")}{" "}
+                ({visibleRows.length}/{rows} 行)
+              </span>
+              <button
+                type="button"
+                className={toolbarButtonClass}
+                title="ソートとフィルタを解除して元の並びに戻す"
+                onClick={clearViewState}
+              >
+                解除
+              </button>
+            </>
+          ) : (
+            // structural ops are hidden while a view is active: column-id based
+            // filter state would go stale across deletes, and insert positions
+            // are ambiguous on a reordered view
+            <StructureToolbar />
+          )}
         </div>
         <div className="ml-auto">
           <ThemeToggle />
@@ -869,7 +1079,7 @@ export default function Spreadsheet() {
                     >
                       {isRowHeader ? null : (
                         <div
-                          className="flex h-full w-full cursor-pointer items-center justify-center"
+                          className="group flex h-full w-full cursor-pointer items-center justify-center"
                           draggable
                           onClick={(e) => clickColumnHeader(dataColIndex, e.shiftKey)}
                           onDragStart={(e) => startColumnDrag(dataColIndex, e)}
@@ -878,6 +1088,37 @@ export default function Spreadsheet() {
                           onDragEnd={endDrag}
                         >
                           {flexRender(header.column.columnDef.header, header.getContext())}
+                          {sortDirByCol.get(header.column.id) && (
+                            <span className="ml-0.5 text-[10px] text-[var(--palm)]">
+                              {sortDirByCol.get(header.column.id) === "asc" ? "▲" : "▼"}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            data-header-menu
+                            draggable={false}
+                            title="ソート / フィルタ"
+                            className={`absolute right-[8px] top-1/2 z-10 flex h-5 w-5 -translate-y-1/2 cursor-pointer items-center justify-center rounded text-[10px] transition-colors hover:bg-[color-mix(in_srgb,var(--palm)_18%,transparent)] hover:text-[var(--palm)] ${
+                              filteredCols.has(header.column.id)
+                                ? "text-[var(--palm)]"
+                                : "text-[var(--sea-ink-soft)]"
+                            } ${
+                              menuColId === header.column.id ||
+                              sortDirByCol.has(header.column.id) ||
+                              filteredCols.has(header.column.id)
+                                ? "opacity-100"
+                                : "opacity-0 group-hover:opacity-100"
+                            }`}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setMenuColId((cur) =>
+                                cur === header.column.id ? null : header.column.id,
+                              );
+                            }}
+                          >
+                            ▾
+                          </button>
                           {header.column.getCanResize() && (
                             <div
                               className={`absolute right-0 top-0 z-10 h-full w-[7px] cursor-col-resize touch-none select-none ${
@@ -895,6 +1136,9 @@ export default function Spreadsheet() {
                             />
                           )}
                         </div>
+                      )}
+                      {!isRowHeader && menuColId === header.column.id && (
+                        <HeaderMenu colId={header.column.id} />
                       )}
                     </th>
                   );
@@ -940,6 +1184,11 @@ export default function Spreadsheet() {
             })}
           </tbody>
         </table>
+        {visibleRows.length === 0 && (
+          <div className="p-6 text-center text-xs text-[var(--sea-ink-soft)]">
+            フィルタに一致する行がありません
+          </div>
+        )}
       </div>
 
       <footer className="flex items-center justify-between border-t border-[var(--line)] bg-[var(--surface-strong)] px-3 py-1 text-xs text-[var(--sea-ink-soft)]">

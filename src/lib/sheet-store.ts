@@ -5,7 +5,9 @@ import { cellId, columnLabel, labelToColumnIndex } from "#/lib/columns";
 import type {
   CellSelectionRange,
   CellSelectionState,
+  ColumnFiltersState,
   ColumnSizingState,
+  SortingState,
 } from "@tanstack/react-table";
 
 export const INITIAL_COLS = 26;
@@ -83,10 +85,24 @@ export function setActiveCell(colIndex: number, rowNumber: number) {
   cellSelectionAtom.set([collapsedRange(c, r)]);
 }
 
+/**
+ * Resolves a vertical move in view order (sorted/filtered row model). Absolute
+ * row arithmetic would land on rows the current view hides, so the component
+ * registers a navigator that walks the table's visible rows instead.
+ */
+type RowNavigator = (rowNumber: number, dRow: number) => number;
+let rowNavigator: RowNavigator | null = null;
+
+export function setRowNavigator(fn: RowNavigator | null) {
+  rowNavigator = fn;
+}
+
 /** Move the active cell by a delta, collapsing any range selection. */
 export function moveActive(dCol: number, dRow: number) {
   const pos = activeCellPos(cellSelectionAtom.get());
-  setActiveCell(pos.colIndex + dCol, pos.rowNumber + dRow);
+  const rowNumber =
+    dRow !== 0 && rowNavigator ? rowNavigator(pos.rowNumber, dRow) : pos.rowNumber + dRow;
+  setActiveCell(pos.colIndex + dCol, rowNumber);
 }
 
 // --- column widths -----------------------------------------------------------
@@ -94,6 +110,54 @@ export function moveActive(dCol: number, dRow: number) {
 // Persisted to the sheet-meta collection by the component (debounced).
 
 export const columnSizingAtom = createAtom<ColumnSizingState>({});
+
+// --- view state (sorting / filtering) ----------------------------------------
+// Display-only: these never touch cell data. Persisted to localStorage (not
+// the server) so a reload keeps the view; other tabs are unaffected.
+
+export const sortingAtom = createAtom<SortingState>([]);
+export const columnFiltersAtom = createAtom<ColumnFiltersState>([]);
+
+export function clearViewState() {
+  sortingAtom.set([]);
+  columnFiltersAtom.set([]);
+}
+
+const VIEW_STATE_KEY = "tanstack-spreadsheet.view";
+
+type PersistedViewState = { sorting: SortingState; columnFilters: ColumnFiltersState };
+
+export function loadPersistedViewState(): PersistedViewState | null {
+  try {
+    const raw = localStorage.getItem(VIEW_STATE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const { sorting, columnFilters } = parsed as Partial<PersistedViewState>;
+    return {
+      sorting: Array.isArray(sorting) ? sorting : [],
+      columnFilters: Array.isArray(columnFilters) ? columnFilters : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function persistViewState() {
+  try {
+    const state: PersistedViewState = {
+      sorting: sortingAtom.get(),
+      columnFilters: columnFiltersAtom.get(),
+    };
+    if (state.sorting.length === 0 && state.columnFilters.length === 0) {
+      localStorage.removeItem(VIEW_STATE_KEY);
+    } else {
+      localStorage.setItem(VIEW_STATE_KEY, JSON.stringify(state));
+    }
+  } catch {
+    // storage unavailable (private mode etc.) — the view just won't survive reloads
+  }
+}
 
 // --- editing -----------------------------------------------------------------
 

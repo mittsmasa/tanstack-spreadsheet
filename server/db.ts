@@ -9,6 +9,7 @@
 // polling; see README.)
 
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
@@ -18,15 +19,23 @@ export const DEFAULT_SHEET = "default";
 
 export type CellRow = { id: string; raw: string };
 
+export type Sheet = { id: string; name: string };
+
 export type CellChange =
   | { type: "insert" | "update"; id: string; raw: string }
   | { type: "delete"; id: string };
+
+export type SheetOpError = "invalid-name" | "duplicate-name" | "unknown-sheet" | "last-sheet";
+
+export type SheetOpResult = { ok: true; sheet: Sheet } | { ok: false; error: SheetOpError };
 
 export type ServerEvents = {
   /** committed cell changes for a sheet */
   cells: [sheet: string, changes: Array<CellChange>];
   /** committed column widths for a sheet */
   meta: [sheet: string, widths: Record<string, number>];
+  /** the sheet list after a create / rename / delete */
+  sheets: [sheets: Array<Sheet>];
 };
 
 export const dbEvents = new EventEmitter<ServerEvents>();
@@ -42,21 +51,128 @@ const client = createClient({
   authToken: process.env.LIBSQL_AUTH_TOKEN,
 });
 
-const ready = client.batch(
-  [
-    `CREATE TABLE IF NOT EXISTS cells (
+const ready = client
+  .batch(
+    [
+      `CREATE TABLE IF NOT EXISTS cells (
       sheet TEXT NOT NULL DEFAULT 'default',
       id TEXT NOT NULL,
       raw TEXT NOT NULL,
       PRIMARY KEY (sheet, id)
     )`,
-    `CREATE TABLE IF NOT EXISTS sheet_meta (
+      `CREATE TABLE IF NOT EXISTS sheet_meta (
       sheet TEXT NOT NULL PRIMARY KEY,
       widths TEXT NOT NULL DEFAULT '{}'
     )`,
-  ],
-  "write",
-);
+      `CREATE TABLE IF NOT EXISTS sheets (
+      id TEXT NOT NULL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE
+    )`,
+    ],
+    "write",
+  )
+  .then(() =>
+    // An empty sheets table means a fresh or pre-multi-sheet DB (deleting the
+    // last sheet is refused, so it can never become empty afterwards). Existing
+    // cell data already lives under sheet 'default', so seeding it as "シート1"
+    // adopts that data without any migration.
+    client.execute(
+      `INSERT INTO sheets (id, name)
+       SELECT '${DEFAULT_SHEET}', 'シート1'
+       WHERE NOT EXISTS (SELECT 1 FROM sheets)`,
+    ),
+  );
+
+export async function getSheets(): Promise<Array<Sheet>> {
+  await ready;
+  const result = await client.execute("SELECT id, name FROM sheets ORDER BY rowid");
+  return result.rows.map((row) => ({ id: String(row.id), name: String(row.name) }));
+}
+
+export async function sheetExists(sheet: string): Promise<boolean> {
+  await ready;
+  const result = await client.execute({
+    sql: "SELECT 1 FROM sheets WHERE id = ?",
+    args: [sheet],
+  });
+  return result.rows.length > 0;
+}
+
+async function emitSheets() {
+  dbEvents.emit("sheets", await getSheets());
+}
+
+/**
+ * Create a sheet. Without a name, picks the first free "シート{N}". An explicit
+ * name must be non-empty and unique (the UNIQUE constraint is checked up front
+ * so callers can map the failure to a proper error instead of a raw SQL error).
+ */
+export async function createSheet(name?: string): Promise<SheetOpResult> {
+  await ready;
+  const sheets = await getSheets();
+  const names = new Set(sheets.map((s) => s.name));
+  let resolved: string;
+  if (name === undefined) {
+    let n = sheets.length + 1;
+    while (names.has(`シート${n}`)) n++;
+    resolved = `シート${n}`;
+  } else {
+    resolved = name.trim();
+    if (resolved === "") return { ok: false, error: "invalid-name" };
+    if (names.has(resolved)) return { ok: false, error: "duplicate-name" };
+  }
+  const sheet: Sheet = { id: randomUUID(), name: resolved };
+  await client.execute({
+    sql: "INSERT INTO sheets (id, name) VALUES (?, ?)",
+    args: [sheet.id, sheet.name],
+  });
+  await emitSheets();
+  return { ok: true, sheet };
+}
+
+export async function renameSheet(id: string, name: string): Promise<SheetOpResult> {
+  await ready;
+  const resolved = name.trim();
+  if (resolved === "") return { ok: false, error: "invalid-name" };
+  const sheets = await getSheets();
+  const target = sheets.find((s) => s.id === id);
+  if (!target) return { ok: false, error: "unknown-sheet" };
+  if (sheets.some((s) => s.id !== id && s.name === resolved)) {
+    return { ok: false, error: "duplicate-name" };
+  }
+  await client.execute({
+    sql: "UPDATE sheets SET name = ? WHERE id = ?",
+    args: [resolved, id],
+  });
+  await emitSheets();
+  return { ok: true, sheet: { id, name: resolved } };
+}
+
+/**
+ * Delete a sheet and its data. The "keep at least one sheet" guard runs inside
+ * a single conditional DELETE so concurrent deletes (two tabs at once) cannot
+ * race the count check and empty the table.
+ */
+export async function deleteSheet(id: string): Promise<SheetOpResult> {
+  await ready;
+  const sheets = await getSheets();
+  const target = sheets.find((s) => s.id === id);
+  if (!target) return { ok: false, error: "unknown-sheet" };
+  const result = await client.execute({
+    sql: "DELETE FROM sheets WHERE id = ? AND (SELECT COUNT(*) FROM sheets) > 1",
+    args: [id],
+  });
+  if (result.rowsAffected === 0) return { ok: false, error: "last-sheet" };
+  await client.batch(
+    [
+      { sql: "DELETE FROM cells WHERE sheet = ?", args: [id] },
+      { sql: "DELETE FROM sheet_meta WHERE sheet = ?", args: [id] },
+    ],
+    "write",
+  );
+  await emitSheets();
+  return { ok: true, sheet: target };
+}
 
 export async function getCells(sheet = DEFAULT_SHEET): Promise<Array<CellRow>> {
   await ready;
@@ -79,6 +195,7 @@ export async function applyCellMutations(
   sheet = DEFAULT_SHEET,
 ): Promise<Array<CellChange>> {
   await ready;
+  if (!(await sheetExists(sheet))) throw new Error(`unknown sheet: ${sheet}`);
   const existing = new Map<string, string>();
   const current = await client.execute({
     sql: "SELECT id, raw FROM cells WHERE sheet = ?",
@@ -142,6 +259,7 @@ export async function setWidths(
   widths: Record<string, number>,
   sheet = DEFAULT_SHEET,
 ): Promise<void> {
+  if (!(await sheetExists(sheet))) throw new Error(`unknown sheet: ${sheet}`);
   const current = await getWidths(sheet);
   const next = JSON.stringify(widths);
   if (JSON.stringify(current) === next) return;

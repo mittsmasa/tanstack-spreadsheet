@@ -14,15 +14,19 @@ import {
   useTable,
 } from "@tanstack/react-table";
 
+import SheetTabs from "#/components/SheetTabs";
 import ThemeToggle from "#/components/ThemeToggle";
-import { cellsCollection, setCell } from "#/db-collections/cells";
-import { loadPersistedWidths, persistWidthsDebounced } from "#/db-collections/sheet-meta";
+import { activeCells, getCellsCollection, setCell } from "#/db-collections/cells";
+import { subscribeSheetSync } from "#/db-collections/server-sync";
+import { persistWidthsDebounced } from "#/db-collections/sheet-meta";
+import { initSheetsSync } from "#/db-collections/sheets";
 import { cellId, columnLabel, labelToColumnIndex, parseCellId } from "#/lib/columns";
 import { ERROR_VALUE, REF_ERROR_VALUE, displayValue } from "#/lib/formula";
 import { historyAtom, recordHistory, redo, undo } from "#/lib/history";
 import {
   activeCellIdOf,
   activeCellPos,
+  activeSheetIdAtom,
   addColumn,
   addRow,
   cellSelectionAtom,
@@ -226,7 +230,7 @@ function clickRowHeader(rowNumber: number, extend: boolean) {
 
 /** Commit one cell value as a single history step; no-op commits record nothing. */
 function setCellWithHistory(id: string, value: string) {
-  const current = cellsCollection.get(id)?.raw;
+  const current = activeCells().get(id)?.raw;
   const unchanged = current === undefined ? value.trim() === "" : current === value;
   if (unchanged) return;
   recordHistory();
@@ -608,7 +612,7 @@ function HeaderMenu({ colId }: { colId: string }) {
 type DragBlock = { kind: "col" | "row"; start: number; end: number };
 type DropIndicator = { kind: "col" | "row"; insert: number };
 
-export default function Spreadsheet() {
+function SheetGrid({ sheetId }: { sheetId: string }) {
   const cols = useStore(sheetStore, (s) => s.cols);
   const rows = useStore(sheetStore, (s) => s.rows);
   const editing = useStore(sheetStore, (s) => s.editing);
@@ -616,10 +620,13 @@ export default function Spreadsheet() {
   const dragRef = useRef<DragBlock | null>(null);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
 
+  // stable per sheet, and this component remounts (key={sheetId}) on switch
+  const collection = getCellsCollection(sheetId);
+
   // spread-select like the official demo: a bare from() emits non-congruent
   // rows for the same key when a cell is updated (react-db 0.x)
   const { data: cellRows } = useLiveQuery((q) =>
-    q.from({ cell: cellsCollection }).select(({ cell }) => ({ ...cell })),
+    q.from({ cell: collection }).select(({ cell }) => ({ ...cell })),
   );
 
   const cellMap = useMemo(() => new Map(cellRows.map((c) => [c.id, c.raw])), [cellRows]);
@@ -660,36 +667,43 @@ export default function Spreadsheet() {
     if (!editing) gridRef.current?.focus();
   }, [editing]);
 
-  // Restore persisted column widths once, then persist changes (debounced,
-  // since a resize drag updates the atom on every mousemove).
+  // Column widths for this sheet: reset the (module-level) atom, follow the
+  // server over the shared SSE stream — the immediate cached snapshot doubles
+  // as the initial load — and persist local changes (debounced, since a resize
+  // drag updates the atom on every mousemove). Ordering matters: the reset and
+  // the snapshot apply happen before the persist subscription exists, so
+  // loading a sheet never echoes its own widths back to the server.
   useEffect(() => {
-    let alive = true;
-    loadPersistedWidths().then((widths) => {
-      if (alive && Object.keys(widths).length > 0) columnSizingAtom.set(widths);
-    });
-    const sub = columnSizingAtom.subscribe((widths) => persistWidthsDebounced(widths));
-    return () => {
-      alive = false;
-      sub.unsubscribe();
+    const apply = (widths: Record<string, number>) => {
+      if (JSON.stringify(columnSizingAtom.get()) !== JSON.stringify(widths)) {
+        columnSizingAtom.set(widths);
+      }
     };
-  }, []);
+    columnSizingAtom.set({});
+    const unsubscribe = subscribeSheetSync(sheetId, {
+      onSnapshot: (data) => apply(data.widths),
+      onWidths: apply,
+    });
+    const sub = columnSizingAtom.subscribe((widths) => persistWidthsDebounced(widths, sheetId));
+    return () => {
+      sub.unsubscribe();
+      unsubscribe();
+    };
+  }, [sheetId]);
 
-  // Restore the sort/filter view once (localStorage, tab-independent), then
-  // keep it saved so a reload comes back with the same view.
+  // Sort/filter view for this sheet (localStorage, tab-independent). The atoms
+  // are module-level, so set them unconditionally — they still hold the
+  // previous sheet's view — before subscribing the persister.
   useEffect(() => {
-    const saved = loadPersistedViewState();
-    if (saved) {
-      if (saved.sorting.length > 0) sortingAtom.set(saved.sorting);
-      if (saved.columnFilters.length > 0) columnFiltersAtom.set(saved.columnFilters);
-    }
-    const subs = [
-      sortingAtom.subscribe(persistViewState),
-      columnFiltersAtom.subscribe(persistViewState),
-    ];
+    const saved = loadPersistedViewState(sheetId);
+    sortingAtom.set(saved?.sorting ?? []);
+    columnFiltersAtom.set(saved?.columnFilters ?? []);
+    const persist = () => persistViewState(sheetId);
+    const subs = [sortingAtom.subscribe(persist), columnFiltersAtom.subscribe(persist)];
     return () => {
       for (const sub of subs) sub.unsubscribe();
     };
-  }, []);
+  }, [sheetId]);
 
   // cellMap is a dependency on purpose: row identity is what invalidates the
   // memoized sorted/filtered row models, so cell edits re-evaluate the view
@@ -1226,6 +1240,8 @@ export default function Spreadsheet() {
         )}
       </div>
 
+      <SheetTabs />
+
       <footer className="flex items-center justify-between border-t border-[var(--line)] bg-[var(--surface-strong)] px-3 py-1 text-xs text-[var(--sea-ink-soft)]">
         <span>
           {cols} 列 × {rows} 行
@@ -1237,4 +1253,18 @@ export default function Spreadsheet() {
       </footer>
     </div>
   );
+}
+
+export default function Spreadsheet() {
+  const sheetId = useSelector(activeSheetIdAtom);
+
+  // sheet list mirror + fallback when the active sheet disappears
+  useEffect(() => {
+    initSheetsSync();
+  }, []);
+
+  // Remount the grid per sheet: every mount-scoped effect and hook (widths,
+  // view state, live query) then naturally re-runs against the new sheet, and
+  // no stale subscription can persist one sheet's state under another's id.
+  return <SheetGrid key={sheetId} sheetId={sheetId} />;
 }

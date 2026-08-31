@@ -15,6 +15,7 @@ import {
 } from "@tanstack/react-table";
 
 import SheetTabs from "#/components/SheetTabs";
+import AccountControls from "#/components/AccountControls";
 import ThemeToggle from "#/components/ThemeToggle";
 import { activeCells, getCellsCollection, setCell } from "#/db-collections/cells";
 import { subscribeSheetSync } from "#/db-collections/server-sync";
@@ -1076,7 +1077,8 @@ function SheetGrid({ sheetId }: { sheetId: string }) {
             <StructureToolbar />
           )}
         </div>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-3">
+          <AccountControls />
           <ThemeToggle />
         </div>
       </header>

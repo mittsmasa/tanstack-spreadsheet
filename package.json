@@ -6,16 +6,19 @@
     "#/*": "./src/*"
   },
   "scripts": {
-    "dev": "vite dev --port 3210",
+    "dev": "./scripts/with-secrets.sh vite dev --port 3210",
     "generate-routes": "tsr generate",
-    "build": "vite build",
-    "preview": "vite preview",
+    "build": "./scripts/with-secrets.sh vite build",
+    "preview": "./scripts/with-secrets.sh vite preview",
+    "auth:migrate": "./scripts/with-secrets.sh pnpm dlx auth@1.7.2 migrate --config server/auth.ts",
     "lint": "oxlint",
     "format": "oxfmt",
     "format:check": "oxfmt --check"
   },
   "dependencies": {
+    "@better-auth/mcp": "^1.7.2",
     "@libsql/client": "^0.17.4",
+    "@libsql/kysely-libsql": "^0.4.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@tailwindcss/vite": "^4.1.18",
     "@tanstack/react-db": "latest",
@@ -26,6 +29,7 @@
     "@tanstack/react-store": "latest",
     "@tanstack/react-table": "latest",
     "@tanstack/store": "latest",
+    "better-auth": "^1.7.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "tailwindcss": "^4.1.18"

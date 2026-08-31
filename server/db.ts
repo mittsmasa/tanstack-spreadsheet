@@ -46,7 +46,9 @@ if (url.startsWith("file:")) {
   mkdirSync(path.dirname(url.slice("file:".length)), { recursive: true });
 }
 
-const client = createClient({
+// Exported so Better Auth can put its own tables in the same database over the
+// same connection (see server/auth.ts).
+export const client = createClient({
   url,
   authToken: process.env.LIBSQL_AUTH_TOKEN,
 });

@@ -9,6 +9,57 @@ pnpm install
 pnpm dev
 ```
 
+初回は認証のセットアップが必要（下記）。
+
+# 認証
+
+Better Auth による Google ログイン必須。未ログインではログイン画面だけが表示され、`/api/*` と SSE は 401、`/mcp` は OAuth のチャレンジを返す。
+
+## セットアップ
+
+1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) で OAuth 同意画面を設定し、「OAuth クライアント ID」を**ウェブアプリケーション**として作成する
+2. 承認済みのリダイレクト URI に `http://localhost:3210/api/auth/callback/google` を追加する
+3. 同意画面の「テストユーザー」に自分の Google アカウントを追加する（公開ステータスが「テスト中」の間、ログインできるのはここに載ったユーザーだけ）
+4. age の秘密鍵を OS keychain に入れる（**リポジトリ外に出るのはこの鍵だけ**）
+
+```bash
+security add-generic-password -s fnox -a FNOX_AGE_KEY -w '<AGE-SECRET-KEY-...>' -U
+```
+
+5. 設定を [fnox](https://github.com/jdx/fnox) の age プロバイダで暗号化して `fnox.toml` に入れる
+
+```bash
+export FNOX_AGE_KEY=$(security find-generic-password -s fnox -a FNOX_AGE_KEY -w)
+openssl rand -base64 32 | fnox --no-daemon set BETTER_AUTH_SECRET
+printf 'http://localhost:3210' | fnox --no-daemon set BETTER_AUTH_URL
+fnox --no-daemon set GOOGLE_CLIENT_ID
+fnox --no-daemon set GOOGLE_CLIENT_SECRET
+```
+
+**`--no-daemon` は必須。**付けないと `✓ Set secret` と表示されるのに書き込まれず、あとで `not found` になる（fnox 1.32.0 で確認）。
+
+6. auth 用テーブルを作る（スプレッドシートと同じ DB ファイルに同居する）
+
+```bash
+pnpm auth:migrate
+```
+
+## 設定の持ち方
+
+暗号化された値は `fnox.toml` に直接入っていて、復号できるのは age 秘密鍵を持つ人だけ。その鍵は OS keychain にあり、リポジトリには含まれない。
+
+`dev` / `build` / `preview` / `auth:migrate` は `scripts/with-secrets.sh` 経由で、keychain から鍵を取り出して `FNOX_AGE_KEY` に載せてから `fnox exec` に渡す（fnox は自分の secrets から `FNOX_AGE_KEY` を解決しないため、この一段が要る）。`pnpm dev` などをそのまま叩けばよい。`vite.config.ts` が `server/auth.ts` を読むため、**build でも設定が必要**。
+
+fnox 本体は `mise.toml` が固定する（npm パッケージではなく mise 経由で入る）。
+
+**注意**: `fnox.toml` の暗号文は public リポジトリに載る。強度は age（X25519 + ChaCha20-Poly1305）と鍵の管理に依存する。平文の credentials は当然コミットしないこと。
+
+## 仕組み
+
+- auth のルートは vite plugin の middleware が `/api/auth/*` にマウントする（`server/plugin.ts`）。ブラウザ向けはセッション Cookie、`/mcp` は OAuth の bearer トークンで検証する
+- auth のテーブルは `server/db.ts` の libsql クライアントを共有するので、`LIBSQL_URL` で Turso に切り替えればそちらへ一緒に移る
+- `/consent` は MCP クライアントの認可を承認する画面。ブラウザから直接開くものではない
+
 # Storage & MCP
 
 ## データの保存先
@@ -27,6 +78,8 @@ dev server が `http://localhost:3210/mcp` に MCP エンドポイント（strea
 ```bash
 claude mcp add --transport http tanstack-spreadsheet http://localhost:3210/mcp
 ```
+
+エンドポイントは OAuth で保護されている。初回接続時にクライアントが自分を動的登録（DCR）し、ブラウザが開いて Google ログイン → 認可画面へ進む。許可するとアクセストークンが発行され、以降はそれで接続する。トークンはログインしたユーザーに紐づく。
 
 ツール:
 

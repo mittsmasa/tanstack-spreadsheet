@@ -6,11 +6,11 @@
     "#/*": "./src/*"
   },
   "scripts": {
-    "dev": "./scripts/with-secrets.sh vite dev --port 3210",
+    "dev": "fnox exec -- vite dev --port 3210",
     "generate-routes": "tsr generate",
-    "build": "./scripts/with-secrets.sh vite build",
-    "preview": "./scripts/with-secrets.sh vite preview",
-    "auth:migrate": "./scripts/with-secrets.sh pnpm dlx auth@1.7.2 migrate --config server/auth.ts",
+    "build": "fnox exec -- vite build",
+    "preview": "fnox exec -- vite preview",
+    "auth:migrate": "fnox exec -- pnpm dlx auth@1.7.2 migrate --config server/auth.ts",
     "lint": "oxlint",
     "format": "oxfmt",
     "format:check": "oxfmt --check"

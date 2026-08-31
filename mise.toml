@@ -1,0 +1,4 @@
+[tools]
+# 認証情報（BETTER_AUTH_SECRET / GOOGLE_CLIENT_*）は fnox が keychain から注入する。
+# vite.config が server/auth.ts を読むため dev / build / preview のすべてで必要。
+"github:jdx/fnox" = "1.32.0"

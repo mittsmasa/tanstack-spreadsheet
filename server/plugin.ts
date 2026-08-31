@@ -1,4 +1,6 @@
 // Vite plugin hosting the whole server side of the spreadsheet:
+//   ALL    /api/auth/*                Better Auth (Google sign-in + OAuth server)
+//   GET    /.well-known/oauth-*       OAuth discovery, served by the auth handler
 //   GET    /api/cells?sheet=          cell snapshot for one sheet
 //   POST   /api/cells/mutations       batch cell writes (raw "" = delete), body carries `sheet`
 //   GET    /api/meta?sheet=           column widths for one sheet
@@ -10,16 +12,23 @@
 //   GET    /api/stream                SSE: all-sheet snapshot, then change batches
 //   ALL    /mcp                       MCP endpoint (streamable HTTP, stateless)
 //
+// Everything except /api/auth and the discovery documents requires a signed-in
+// user: the browser routes check the session cookie, /mcp checks an OAuth
+// bearer token.
+//
 // Everything lives in one plugin on purpose: the Start server routes run in a
 // separate module graph, so splitting the pieces would duplicate the db module
 // and silently disconnect the change feed from the SSE subscribers.
 
+import { requireMcpAuth } from "@better-auth/mcp";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 
 import { cellId, parseCellId } from "../src/lib/columns";
 import { displayValue } from "../src/lib/formula";
+import { BASE_URL, MCP_RESOURCE, auth } from "./auth";
 import {
   DEFAULT_SHEET,
   applyCellMutations,
@@ -64,6 +73,63 @@ function readBody(req: IncomingMessage): Promise<unknown> {
 function sendJson(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+// --- auth ---------------------------------------------------------------------
+
+const authHandler = toNodeHandler(auth);
+
+/** Discovery documents MCP clients fetch from the origin root. Better Auth's
+ * router runs its plugin onRequest hooks before base-path routing, so handing
+ * these straight to the auth handler is enough to serve them. */
+function isDiscoveryPath(pathname: string): boolean {
+  return (
+    pathname === "/.well-known/openid-configuration" ||
+    pathname.startsWith("/.well-known/oauth-authorization-server") ||
+    pathname.startsWith("/.well-known/oauth-protected-resource")
+  );
+}
+
+async function writeWebResponse(res: ServerResponse, response: Response) {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  res.writeHead(response.status, headers);
+  res.end(Buffer.from(await response.arrayBuffer()));
+}
+
+/** Reply 401 unless a session cookie identifies a signed-in user. */
+async function requireSession(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
+  if (session) return true;
+  sendJson(res, 401, { error: "unauthorized" });
+  return false;
+}
+
+// requireMcpAuth speaks Web Request/Response while the MCP transport needs the
+// raw Node req/res, so it runs as a gate only: this sentinel status means the
+// bearer token checked out and the real handler should take over, and anything
+// else is the RFC 9728 challenge to send back verbatim.
+const MCP_TOKEN_OK = 204;
+
+const mcpGate = requireMcpAuth(auth, () => new Response(null, { status: MCP_TOKEN_OK }), {
+  resource: MCP_RESOURCE,
+});
+
+/** Reply with an OAuth challenge unless the request carries a valid MCP token. */
+async function requireMcpToken(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  // Token verification reads only the method, URL and headers, so the body is
+  // left on the stream for the MCP transport to consume.
+  const verdict = await mcpGate(
+    new Request(new URL(req.url ?? "/", BASE_URL), {
+      method: req.method ?? "GET",
+      headers: fromNodeHeaders(req.headers),
+    }),
+  );
+  if (verdict.status === MCP_TOKEN_OK) return true;
+  await writeWebResponse(res, verdict);
+  return false;
 }
 
 /** Sheet id from a POST body's optional `sheet` field. */
@@ -386,10 +452,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolea
   const { pathname, searchParams } = new URL(req.url ?? "", "http://localhost");
   const method = req.method ?? "GET";
 
-  if (pathname === "/mcp") {
-    await handleMcp(req, res);
+  if (pathname.startsWith("/api/auth/") || isDiscoveryPath(pathname)) {
+    await authHandler(req, res);
     return true;
   }
+  if (pathname === "/mcp") {
+    if (await requireMcpToken(req, res)) await handleMcp(req, res);
+    return true;
+  }
+  // Everything below is the signed-in user's own data.
+  if (pathname.startsWith("/api/") && !(await requireSession(req, res))) return true;
   if (pathname === "/api/stream" && method === "GET") {
     await handleStream(req, res);
     return true;

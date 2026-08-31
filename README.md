@@ -23,13 +23,12 @@ Better Auth による Google ログイン必須。未ログインではログイ
 4. age の秘密鍵を OS keychain に入れる（**リポジトリ外に出るのはこの鍵だけ**）
 
 ```bash
-security add-generic-password -s fnox -a FNOX_AGE_KEY -w '<AGE-SECRET-KEY-...>' -U
+security add-generic-password -s fnox -a age-key -w '<AGE-SECRET-KEY-...>' -U
 ```
 
 5. 設定を [fnox](https://github.com/jdx/fnox) の age プロバイダで暗号化して `fnox.toml` に入れる
 
 ```bash
-export FNOX_AGE_KEY=$(security find-generic-password -s fnox -a FNOX_AGE_KEY -w)
 openssl rand -base64 32 | fnox --no-daemon set BETTER_AUTH_SECRET
 printf 'http://localhost:3210' | fnox --no-daemon set BETTER_AUTH_URL
 fnox --no-daemon set GOOGLE_CLIENT_ID
@@ -46,9 +45,9 @@ pnpm auth:migrate
 
 ## 設定の持ち方
 
-暗号化された値は `fnox.toml` に直接入っていて、復号できるのは age 秘密鍵を持つ人だけ。その鍵は OS keychain にあり、リポジトリには含まれない。
+暗号化された値は `fnox.toml` に直接入っていて、復号できるのは age 秘密鍵を持つ人だけ。その鍵は OS keychain にあり、リポジトリには含まれない。`fnox.toml` の `auth_command` が keychain から鍵を取り出すので、事前に環境変数を用意する必要はない。
 
-`dev` / `build` / `preview` / `auth:migrate` は `scripts/with-secrets.sh` 経由で、keychain から鍵を取り出して `FNOX_AGE_KEY` に載せてから `fnox exec` に渡す（fnox は自分の secrets から `FNOX_AGE_KEY` を解決しないため、この一段が要る）。`pnpm dev` などをそのまま叩けばよい。`vite.config.ts` が `server/auth.ts` を読むため、**build でも設定が必要**。
+`dev` / `build` / `preview` / `auth:migrate` は `fnox exec` を内包しているので、`pnpm dev` などをそのまま叩けばよい。`vite.config.ts` が `server/auth.ts` を読むため、**build でも設定が必要**。
 
 fnox 本体は `mise.toml` が固定する（npm パッケージではなく mise 経由で入る）。
 

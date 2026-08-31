@@ -68,6 +68,14 @@ const ready = client
       id TEXT NOT NULL PRIMARY KEY,
       name TEXT NOT NULL UNIQUE
     )`,
+      `CREATE TABLE IF NOT EXISTS history (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      sheet TEXT NOT NULL,
+      client TEXT NOT NULL,
+      ops TEXT NOT NULL,
+      undone INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    )`,
     ],
     "write",
   )
@@ -167,6 +175,7 @@ export async function deleteSheet(id: string): Promise<SheetOpResult> {
     [
       { sql: "DELETE FROM cells WHERE sheet = ?", args: [id] },
       { sql: "DELETE FROM sheet_meta WHERE sheet = ?", args: [id] },
+      { sql: "DELETE FROM history WHERE sheet = ?", args: [id] },
     ],
     "write",
   );
@@ -189,10 +198,15 @@ export async function getCells(sheet = DEFAULT_SHEET): Promise<Array<CellRow>> {
  * from the current DB state so subscribers never see a delete+insert of the
  * same key (the react-db live-query congruence pitfall). No-op writes are
  * dropped from the emitted batch.
+ *
+ * With `recordFor`, the applied batch is also written to the history table as
+ * one undoable entry owned by that client (undo/redo application itself passes
+ * no recordFor, which is what keeps undos out of the history).
  */
 export async function applyCellMutations(
   cells: ReadonlyArray<CellRow>,
   sheet = DEFAULT_SHEET,
+  recordFor?: string,
 ): Promise<Array<CellChange>> {
   await ready;
   if (!(await sheetExists(sheet))) throw new Error(`unknown sheet: ${sheet}`);
@@ -205,6 +219,7 @@ export async function applyCellMutations(
 
   const statements: Array<{ sql: string; args: Array<string> }> = [];
   const changes: Array<CellChange> = [];
+  const ops: Array<HistoryOp> = [];
   // last write wins within a single batch
   const latest = new Map<string, string>();
   for (const cell of cells) latest.set(cell.id, cell.raw);
@@ -215,26 +230,127 @@ export async function applyCellMutations(
       if (prev === undefined) continue;
       statements.push({ sql: "DELETE FROM cells WHERE sheet = ? AND id = ?", args: [sheet, id] });
       changes.push({ type: "delete", id });
+      ops.push({ id, before: prev, after: "" });
     } else if (prev === undefined) {
       statements.push({
         sql: "INSERT INTO cells (sheet, id, raw) VALUES (?, ?, ?)",
         args: [sheet, id, raw],
       });
       changes.push({ type: "insert", id, raw });
+      ops.push({ id, before: "", after: raw });
     } else if (prev !== raw) {
       statements.push({
         sql: "UPDATE cells SET raw = ? WHERE sheet = ? AND id = ?",
         args: [raw, sheet, id],
       });
       changes.push({ type: "update", id, raw });
+      ops.push({ id, before: prev, after: raw });
     }
   }
 
   if (statements.length > 0) {
     await client.batch(statements, "write");
+    if (recordFor !== undefined) await recordHistoryEntry(sheet, recordFor, ops);
     dbEvents.emit("cells", sheet, changes);
   }
   return changes;
+}
+
+// --- history -----------------------------------------------------------------
+// Per-client undo/redo, one shared log per sheet. An entry stores before/after
+// per cell ("" = absent), so undo applies the befores and redo the afters.
+// Stack semantics via the `undone` flag: a client's undone entries always form
+// a contiguous suffix of its history because recording a new entry clears them
+// (the standard "new edit discards redo"), so undo = newest not-undone entry
+// and redo = oldest undone entry.
+
+/** One cell's transition inside a history entry; "" means "cell absent". */
+type HistoryOp = { id: string; before: string; after: string };
+
+const MAX_HISTORY_PER_SHEET = 200;
+
+async function recordHistoryEntry(sheet: string, client_: string, ops: Array<HistoryOp>) {
+  await client.batch(
+    [
+      {
+        sql: "DELETE FROM history WHERE sheet = ? AND client = ? AND undone = 1",
+        args: [sheet, client_],
+      },
+      {
+        sql: "INSERT INTO history (sheet, client, ops, undone, created_at) VALUES (?, ?, ?, 0, ?)",
+        args: [sheet, client_, JSON.stringify(ops), new Date().toISOString()],
+      },
+      {
+        sql: `DELETE FROM history WHERE sheet = ? AND seq NOT IN (
+                SELECT seq FROM history WHERE sheet = ? ORDER BY seq DESC LIMIT ${MAX_HISTORY_PER_SHEET}
+              )`,
+        args: [sheet, sheet],
+      },
+    ],
+    "write",
+  );
+}
+
+export type HistoryState = { canUndo: boolean; canRedo: boolean };
+
+export async function historyState(sheet: string, client_: string): Promise<HistoryState> {
+  await ready;
+  const result = await client.execute({
+    sql: `SELECT
+            EXISTS(SELECT 1 FROM history WHERE sheet = ? AND client = ? AND undone = 0) AS canUndo,
+            EXISTS(SELECT 1 FROM history WHERE sheet = ? AND client = ? AND undone = 1) AS canRedo`,
+    args: [sheet, client_, sheet, client_],
+  });
+  const row = result.rows[0];
+  return { canUndo: Number(row?.canUndo) === 1, canRedo: Number(row?.canRedo) === 1 };
+}
+
+/**
+ * Undo (direction "undo") or redo ("redo") the client's nearest entry.
+ * Conflict rule, per cell: only restore a cell whose current value still
+ * matches what this entry left it as (undo checks `after`, redo checks
+ * `before`); cells overwritten by someone else since are skipped. The entry
+ * flips regardless, so a fully-conflicted entry just applies nothing.
+ */
+export async function applyHistory(
+  sheet: string,
+  client_: string,
+  direction: "undo" | "redo",
+): Promise<{ applied: number } & HistoryState> {
+  await ready;
+  const entry = await client.execute(
+    direction === "undo"
+      ? {
+          sql: "SELECT seq, ops FROM history WHERE sheet = ? AND client = ? AND undone = 0 ORDER BY seq DESC LIMIT 1",
+          args: [sheet, client_],
+        }
+      : {
+          sql: "SELECT seq, ops FROM history WHERE sheet = ? AND client = ? AND undone = 1 ORDER BY seq ASC LIMIT 1",
+          args: [sheet, client_],
+        },
+  );
+  const row = entry.rows[0];
+  if (!row) return { applied: 0, ...(await historyState(sheet, client_)) };
+  const ops = JSON.parse(String(row.ops)) as Array<HistoryOp>;
+
+  const current = await client.execute({
+    sql: "SELECT id, raw FROM cells WHERE sheet = ?",
+    args: [sheet],
+  });
+  const currentRaw = new Map(current.rows.map((r) => [String(r.id), String(r.raw)]));
+
+  const writes: Array<CellRow> = [];
+  for (const op of ops) {
+    const expected = direction === "undo" ? op.after : op.before;
+    const target = direction === "undo" ? op.before : op.after;
+    if ((currentRaw.get(op.id) ?? "") === expected) writes.push({ id: op.id, raw: target });
+  }
+  const changes = await applyCellMutations(writes, sheet);
+  await client.execute({
+    sql: "UPDATE history SET undone = ? WHERE seq = ?",
+    args: [direction === "undo" ? 1 : 0, Number(row.seq)],
+  });
+  return { applied: changes.length, ...(await historyState(sheet, client_)) };
 }
 
 export async function getWidths(sheet = DEFAULT_SHEET): Promise<Record<string, number>> {

@@ -1,115 +1,121 @@
-// Operation-level undo/redo: every user operation pushes a snapshot of the
-// whole sheet state (cells, grid size, column widths, selection) right before
-// it mutates anything. Undo restores the snapshot by diffing against the
-// current state; redo mirrors it. History is per-tab and in-memory only,
-// with one undo/redo stack pair per sheet — a snapshot must only ever be
-// restored onto the sheet it was taken from, so undo/redo always operate on
-// the active sheet's stacks and switching sheets just swaps which pair is
-// live (returning to a sheet brings its history back).
+// Server-shared, per-client undo/redo. Every user operation runs inside one
+// react-db transaction (runOperation) whose mutationFn posts the whole batch
+// as a single mutation request tagged with this browser's client id; the
+// server records it as one undoable history entry. Undo/redo just call the
+// history endpoints — the server applies the inverse and the change comes back
+// over the shared SSE stream like any other remote edit, so nothing here
+// mutates collections directly and undone changes are never re-recorded.
+//
+// canUndo/canRedo are per (sheet, client), so the atom refreshes from the
+// endpoint responses, on sheet switches, and whenever the active sheet
+// receives a cells event (another tab of the same client may have edited).
 
+import { createTransaction } from "@tanstack/react-db";
 import { createAtom } from "@tanstack/store";
 
-import { activeCells, applyCellsDiff } from "#/db-collections/cells";
-import { persistWidths } from "#/db-collections/sheet-meta";
-import {
-  activeSheetIdAtom,
-  cellSelectionAtom,
-  columnSizingAtom,
-  sheetStore,
-  stopEditing,
-} from "#/lib/sheet-store";
+import { subscribeSheetSync } from "#/db-collections/server-sync";
+import { getClientId } from "#/lib/client-id";
+import { activeSheetIdAtom, stopEditing } from "#/lib/sheet-store";
 
 import type { Cell } from "#/db-collections/cells";
-import type { CellSelectionState, ColumnSizingState } from "@tanstack/react-table";
 
-const MAX_HISTORY = 100;
+type HistoryState = { canUndo: boolean; canRedo: boolean };
 
-type Snapshot = {
-  cells: Array<Cell>;
-  rows: number;
-  cols: number;
-  widths: ColumnSizingState;
-  selection: CellSelectionState;
-};
+export const historyAtom = createAtom<HistoryState>({ canUndo: false, canRedo: false });
 
-type Stacks = { undo: Array<Snapshot>; redo: Array<Snapshot> };
+/** Adopt a server-reported state, unless the user has switched sheets since. */
+function applyState(sheet: string, state: HistoryState) {
+  if (sheet !== activeSheetIdAtom.get()) return;
+  historyAtom.set({ canUndo: state.canUndo === true, canRedo: state.canRedo === true });
+}
 
-const stacksBySheet = new Map<string, Stacks>();
-
-function activeStacks(): Stacks {
-  const sheetId = activeSheetIdAtom.get();
-  let stacks = stacksBySheet.get(sheetId);
-  if (!stacks) {
-    stacks = { undo: [], redo: [] };
-    stacksBySheet.set(sheetId, stacks);
+async function fetchState(sheet: string) {
+  try {
+    const params = new URLSearchParams({ sheet, client: getClientId() });
+    const res = await fetch(`/api/history/state?${params}`);
+    if (!res.ok) return;
+    applyState(sheet, (await res.json()) as HistoryState);
+  } catch {
+    // stream keeps working without button state; the next operation refreshes it
   }
-  return stacks;
-}
-
-export const historyAtom = createAtom({ canUndo: false, canRedo: false });
-
-function syncHistoryAtom() {
-  const stacks = activeStacks();
-  historyAtom.set({ canUndo: stacks.undo.length > 0, canRedo: stacks.redo.length > 0 });
-}
-
-// a sheet switch swaps the live stack pair, so the buttons must re-derive
-activeSheetIdAtom.subscribe(syncHistoryAtom);
-
-/** Forget a deleted sheet's history (its snapshots have nowhere to restore to). */
-export function dropHistory(sheetId: string) {
-  stacksBySheet.delete(sheetId);
-  syncHistoryAtom();
-}
-
-function captureSnapshot(): Snapshot {
-  const { rows, cols } = sheetStore.state;
-  return {
-    // copy only the cell fields: synced rows can carry internal metadata
-    // ($synced/$origin) that must not end up back in storage on restore
-    cells: activeCells().toArray.map((c) => ({ id: c.id, raw: c.raw })),
-    rows,
-    cols,
-    widths: { ...columnSizingAtom.get() },
-    selection: cellSelectionAtom.get().map((r) => ({ ...r })),
-  };
-}
-
-function restoreSnapshot(snapshot: Snapshot) {
-  stopEditing();
-  applyCellsDiff(snapshot.cells);
-  sheetStore.setState((s) => ({ ...s, rows: snapshot.rows, cols: snapshot.cols }));
-  columnSizingAtom.set({ ...snapshot.widths });
-  persistWidths(snapshot.widths, activeSheetIdAtom.get());
-  cellSelectionAtom.set(snapshot.selection.map((r) => ({ ...r })));
 }
 
 /**
- * Record the current state as an undo step. Call right before a user
- * operation mutates the sheet; a new operation discards the redo stack.
+ * Run one user operation as one undoable history entry. The callback must be
+ * synchronous and only mutate the active sheet's cells collection; all its
+ * inserts/updates/deletes are grouped into a single transaction and posted as
+ * one batch (instead of one request per collection call via the collection's
+ * own mutation handlers).
  */
-export function recordHistory() {
-  const stacks = activeStacks();
-  stacks.undo.push(captureSnapshot());
-  if (stacks.undo.length > MAX_HISTORY) stacks.undo.shift();
-  stacks.redo.length = 0;
-  syncHistoryAtom();
+export function runOperation(mutate: () => void) {
+  const sheet = activeSheetIdAtom.get();
+  const tx = createTransaction<Cell>({
+    mutationFn: async ({ transaction }) => {
+      const cells = transaction.mutations.map((m) =>
+        m.type === "delete"
+          ? { id: String(m.key), raw: "" }
+          : { id: m.modified.id, raw: m.modified.raw },
+      );
+      const res = await fetch("/api/cells/mutations", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sheet, cells, client: getClientId() }),
+      });
+      if (!res.ok) throw new Error(`cell mutation failed: ${res.status}`);
+      applyState(sheet, (await res.json()) as HistoryState);
+    },
+  });
+  tx.mutate(mutate);
+  tx.isPersisted.promise.catch((error: unknown) => {
+    // the transaction rolled the optimistic changes back; just surface it
+    console.warn("[history] persisting an operation failed:", error);
+  });
 }
 
+async function applyHistoryOp(direction: "undo" | "redo") {
+  stopEditing();
+  const sheet = activeSheetIdAtom.get();
+  try {
+    const res = await fetch(`/api/history/${direction}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sheet, client: getClientId() }),
+    });
+    if (!res.ok) return;
+    applyState(sheet, (await res.json()) as HistoryState);
+  } catch {
+    // offline etc. — the sheet is simply left as-is
+  }
+}
+
+// Serialized per tab: a burst of Cmd+Z must undo entries one at a time, not
+// race several requests at the same newest entry.
+let historyOps: Promise<void> = Promise.resolve();
+
 export function undo() {
-  const stacks = activeStacks();
-  const snapshot = stacks.undo.pop();
-  if (!snapshot) return;
-  stacks.redo.push(captureSnapshot());
-  restoreSnapshot(snapshot);
-  syncHistoryAtom();
+  historyOps = historyOps.then(() => applyHistoryOp("undo"));
 }
 
 export function redo() {
-  const stacks = activeStacks();
-  const snapshot = stacks.redo.pop();
-  if (!snapshot) return;
-  stacks.undo.push(captureSnapshot());
-  restoreSnapshot(snapshot);
-  syncHistoryAtom();
+  historyOps = historyOps.then(() => applyHistoryOp("redo"));
+}
+
+if (typeof window !== "undefined") {
+  let unwatch: (() => void) | null = null;
+  const watch = (sheet: string) => {
+    unwatch?.();
+    unwatch = subscribeSheetSync(sheet, {
+      onSnapshot: () => void fetchState(sheet),
+      onCellChanges: () => void fetchState(sheet),
+    });
+  };
+  watch(activeSheetIdAtom.get());
+  activeSheetIdAtom.subscribe(() => {
+    const sheet = activeSheetIdAtom.get();
+    // per-sheet state: blank the buttons until the new sheet's state arrives
+    historyAtom.set({ canUndo: false, canRedo: false });
+    watch(sheet);
+    void fetchState(sheet);
+  });
+  void fetchState(activeSheetIdAtom.get());
 }

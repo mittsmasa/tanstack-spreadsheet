@@ -23,12 +23,14 @@ import { displayValue } from "../src/lib/formula";
 import {
   DEFAULT_SHEET,
   applyCellMutations,
+  applyHistory,
   createSheet,
   dbEvents,
   deleteSheet,
   getCells,
   getSheets,
   getWidths,
+  historyState,
   renameSheet,
   setWidths,
   sheetExists,
@@ -68,6 +70,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
 function sheetOf(body: unknown): string {
   const sheet = (body as { sheet?: unknown } | null)?.sheet;
   return typeof sheet === "string" ? sheet : DEFAULT_SHEET;
+}
+
+/** History-owner client id from a body's optional `client` field. Mutations
+ * without one still apply, they just aren't recorded as undoable. */
+function clientOf(body: unknown): string | undefined {
+  const client = (body as { client?: unknown } | null)?.client;
+  return typeof client === "string" && client.trim() !== "" ? client : undefined;
 }
 
 const SHEET_OP_STATUS: Record<SheetOpError, number> = {
@@ -176,7 +185,7 @@ const TOOLS = [
   {
     name: "set_cells",
     description:
-      'Write cells in one batch. Each entry is {id, raw}; raw is the user-level input (a leading "=" makes it a formula) and an empty string deletes the cell. The whole batch is rejected if any id is invalid. Changes appear live in open browser tabs and are undoable there only for edits made in the UI, not for this tool.',
+      'Write cells in one batch. Each entry is {id, raw}; raw is the user-level input (a leading "=" makes it a formula) and an empty string deletes the cell. The whole batch is rejected if any id is invalid. Changes appear live in open browser tabs. Undo history is per client: each batch is recorded as one undoable entry owned by the "mcp" client, so browser users cannot undo it (and their undos never revert it).',
     inputSchema: {
       type: "object",
       properties: {
@@ -279,7 +288,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<To
           'invalid cells payload: expected [{id: "A1", raw: "..."}] with valid cell ids',
         );
       }
-      const changes = await applyCellMutations(cells, sheet.id);
+      const changes = await applyCellMutations(cells, sheet.id, "mcp");
       return toolJson({ applied: changes.length });
     }
     case "get_snapshot": {
@@ -400,8 +409,34 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolea
     }
     const sheet = sheetOf(body);
     if (!(await requireSheet(res, sheet))) return true;
-    const changes = await applyCellMutations(cells, sheet);
-    sendJson(res, 200, { applied: changes.length });
+    const client = clientOf(body);
+    const changes = await applyCellMutations(cells, sheet, client);
+    const state = client === undefined ? {} : await historyState(sheet, client);
+    sendJson(res, 200, { applied: changes.length, ...state });
+    return true;
+  }
+  if ((pathname === "/api/history/undo" || pathname === "/api/history/redo") && method === "POST") {
+    const body = await readBody(req).catch(() => null);
+    const client = clientOf(body);
+    if (client === undefined) {
+      sendJson(res, 400, { error: "missing client" });
+      return true;
+    }
+    const sheet = sheetOf(body);
+    if (!(await requireSheet(res, sheet))) return true;
+    const direction = pathname === "/api/history/undo" ? "undo" : "redo";
+    sendJson(res, 200, await applyHistory(sheet, client, direction));
+    return true;
+  }
+  if (pathname === "/api/history/state" && method === "GET") {
+    const client = searchParams.get("client");
+    if (client === null || client.trim() === "") {
+      sendJson(res, 400, { error: "missing client" });
+      return true;
+    }
+    const sheet = searchParams.get("sheet") ?? DEFAULT_SHEET;
+    if (!(await requireSheet(res, sheet))) return true;
+    sendJson(res, 200, await historyState(sheet, client));
     return true;
   }
   if (pathname === "/api/meta" && method === "GET") {

@@ -22,7 +22,7 @@ import { persistWidthsDebounced } from "#/db-collections/sheet-meta";
 import { initSheetsSync } from "#/db-collections/sheets";
 import { cellId, columnLabel, labelToColumnIndex, parseCellId } from "#/lib/columns";
 import { ERROR_VALUE, REF_ERROR_VALUE, displayValue } from "#/lib/formula";
-import { historyAtom, recordHistory, redo, undo } from "#/lib/history";
+import { historyAtom, redo, runOperation, undo } from "#/lib/history";
 import {
   activeCellIdOf,
   activeCellPos,
@@ -233,8 +233,7 @@ function setCellWithHistory(id: string, value: string) {
   const current = activeCells().get(id)?.raw;
   const unchanged = current === undefined ? value.trim() === "" : current === value;
   if (unchanged) return;
-  recordHistory();
-  setCell(id, value);
+  runOperation(() => setCell(id, value));
 }
 
 function CellEditor({ id, initial }: { id: string; initial: string }) {
@@ -813,8 +812,9 @@ function SheetGrid({ sheetId }: { sheetId: string }) {
       }
     }
     if (ids.length === 0) return;
-    recordHistory();
-    for (const id of ids) setCell(id, "");
+    runOperation(() => {
+      for (const id of ids) setCell(id, "");
+    });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -896,16 +896,17 @@ function SheetGrid({ sheetId }: { sheetId: string }) {
     // 末尾の改行（Excel コピーの慣例）が生む空行は貼り付け対象にしない
     const last = lines[lines.length - 1];
     if (lines.length > 1 && last?.length === 1 && last[0] === "") lines.pop();
-    recordHistory();
     const origin = activeCellPos(cellSelectionAtom.get());
     let width = 0;
-    lines.forEach((values, i) => {
-      width = Math.max(width, values.length);
-      values.forEach((value, j) => {
-        const colIndex = origin.colIndex + j;
-        const rowNumber = origin.rowNumber + i;
-        ensureFits(colIndex, rowNumber);
-        setCell(cellId(colIndex, rowNumber), value);
+    runOperation(() => {
+      lines.forEach((values, i) => {
+        width = Math.max(width, values.length);
+        values.forEach((value, j) => {
+          const colIndex = origin.colIndex + j;
+          const rowNumber = origin.rowNumber + i;
+          ensureFits(colIndex, rowNumber);
+          setCell(cellId(colIndex, rowNumber), value);
+        });
       });
     });
     cellSelectionAtom.set([
@@ -1042,24 +1043,10 @@ function SheetGrid({ sheetId }: { sheetId: string }) {
           tanstack-spreadsheet
         </h1>
         <div className="flex gap-1.5">
-          <button
-            type="button"
-            className={toolbarButtonClass}
-            onClick={() => {
-              recordHistory();
-              addRow();
-            }}
-          >
+          <button type="button" className={toolbarButtonClass} onClick={addRow}>
             + 行
           </button>
-          <button
-            type="button"
-            className={toolbarButtonClass}
-            onClick={() => {
-              recordHistory();
-              addColumn();
-            }}
-          >
+          <button type="button" className={toolbarButtonClass} onClick={addColumn}>
             + 列
           </button>
           <UndoRedoButtons />

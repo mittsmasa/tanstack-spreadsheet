@@ -4,7 +4,6 @@
 // fed by the shared SSE stream is enough.
 
 import { subscribeSheetsList } from "#/db-collections/server-sync";
-import { dropHistory } from "#/lib/history";
 import { activeSheetIdAtom, sheetsAtom, switchSheet } from "#/lib/sheet-store";
 
 import type { SheetInfo } from "#/db-collections/server-sync";
@@ -56,9 +55,6 @@ export function initSheetsSync() {
   started = true;
   subscribeSheetsList((sheets) => {
     const known = new Set(sheets.map((sheet) => sheet.id));
-    for (const previous of sheetsAtom.get()) {
-      if (!known.has(previous.id)) dropHistory(previous.id);
-    }
     sheetsAtom.set(sheets);
     const first = sheets[0];
     if (first && !known.has(activeSheetIdAtom.get())) switchSheet(first.id);

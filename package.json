@@ -11,6 +11,7 @@
     "build": "fnox exec -- vite build",
     "preview": "fnox exec -- vite preview",
     "auth:migrate": "fnox exec -- pnpm dlx auth@1.7.2 migrate --config server/auth.ts",
+    "type-check": "tsc --noEmit",
     "lint": "oxlint",
     "format": "oxfmt",
     "format:check": "oxfmt --check"

@@ -2,7 +2,7 @@ import { Store, createAtom } from "@tanstack/store";
 
 import { cellId, columnLabel, labelToColumnIndex } from "#/lib/columns";
 
-import type { SheetInfo } from "#/db-collections/server-sync";
+import type { BookInfo, SheetInfo } from "#/db-collections/server-sync";
 import type {
   CellSelectionRange,
   CellSelectionState,
@@ -13,9 +13,6 @@ import type {
 
 export const INITIAL_COLS = 26;
 export const INITIAL_ROWS = 50;
-
-/** Sheet id the server seeds for a fresh / pre-multi-sheet DB. */
-export const DEFAULT_SHEET_ID = "default";
 
 export type EditingState = {
   cellId: string;
@@ -38,35 +35,39 @@ export const sheetStore = new Store<SheetState>({
   rows: INITIAL_ROWS,
 });
 
-// --- sheets ------------------------------------------------------------------
-// The sheet list mirrors the server (via the shared SSE stream); the active
-// sheet id is tab-local and only remembered across reloads, not synced live
-// (another tab switching sheets must not drag this one along).
+// --- books and sheets --------------------------------------------------------
+// The book comes from the URL (/b/$bookId); activeBookIdAtom mirrors it so
+// non-React modules (cells, history, structure) can read it without a hook.
+// The book's sheet list mirrors the server via the shared SSE stream, and the
+// active sheet is tab-local: remembered per book across reloads, but not
+// synced live (another tab switching sheets must not drag this one along).
 
-const ACTIVE_SHEET_KEY = "tanstack-spreadsheet.activeSheet";
+/** Which sheet this tab last looked at in a given book. */
+function activeSheetKey(bookId: string) {
+  return `tanstack-spreadsheet.activeSheet:${bookId}`;
+}
 
-function loadActiveSheetId(): string {
-  if (typeof window === "undefined") return DEFAULT_SHEET_ID;
+function loadActiveSheetId(bookId: string): string {
   try {
-    return localStorage.getItem(ACTIVE_SHEET_KEY) ?? DEFAULT_SHEET_ID;
+    return localStorage.getItem(activeSheetKey(bookId)) ?? "";
   } catch {
-    return DEFAULT_SHEET_ID;
+    return "";
   }
 }
 
+export const booksAtom = createAtom<Array<BookInfo>>([]);
+export const activeBookIdAtom = createAtom<string>("");
 export const sheetsAtom = createAtom<Array<SheetInfo>>([]);
-export const activeSheetIdAtom = createAtom<string>(loadActiveSheetId());
+// "" until the book's sheet list arrives (or a remembered id is restored);
+// the grid renders nothing while it is empty.
+export const activeSheetIdAtom = createAtom<string>("");
 
 // rows/cols are session state (recovered from cells via ensureFits), so a
 // sheet keeps its grid size while the tab lives but not across reloads
 const gridSizeBySheet = new Map<string, { rows: number; cols: number }>();
 
-/** Switch the active sheet: park this sheet's grid size, reset per-sheet UI
- * state (editing, selection, view), and remount the grid via the atom. */
-export function switchSheet(id: string) {
-  const current = activeSheetIdAtom.get();
-  if (id === current) return;
-  gridSizeBySheet.set(current, { rows: sheetStore.state.rows, cols: sheetStore.state.cols });
+/** Reset the per-sheet UI state and adopt the grid size parked for `id`. */
+function adoptSheetUiState(id: string) {
   stopEditing();
   cellSelectionAtom.set([collapsedRange(0, 1)]);
   const saved = gridSizeBySheet.get(id);
@@ -75,12 +76,42 @@ export function switchSheet(id: string) {
     rows: saved?.rows ?? INITIAL_ROWS,
     cols: saved?.cols ?? INITIAL_COLS,
   }));
+}
+
+function parkGridSize(sheetId: string) {
+  if (sheetId === "") return;
+  gridSizeBySheet.set(sheetId, { rows: sheetStore.state.rows, cols: sheetStore.state.cols });
+}
+
+/** Switch the active sheet: park this sheet's grid size, reset per-sheet UI
+ * state (editing, selection, view), and remount the grid via the atom. */
+export function switchSheet(id: string) {
+  const current = activeSheetIdAtom.get();
+  if (id === current) return;
+  parkGridSize(current);
+  adoptSheetUiState(id);
   activeSheetIdAtom.set(id);
   try {
-    localStorage.setItem(ACTIVE_SHEET_KEY, id);
+    localStorage.setItem(activeSheetKey(activeBookIdAtom.get()), id);
   } catch {
     // storage unavailable — the active sheet just won't survive reloads
   }
+}
+
+/**
+ * Adopt the book the URL points at. The sheet list for it arrives later over
+ * the stream, so the active sheet is restored from what this tab last looked
+ * at in that book and left blank when there is nothing remembered; the sheet
+ * list mirror corrects it either way.
+ */
+export function setActiveBook(id: string) {
+  if (id === activeBookIdAtom.get()) return;
+  parkGridSize(activeSheetIdAtom.get());
+  const remembered = loadActiveSheetId(id);
+  adoptSheetUiState(remembered);
+  activeBookIdAtom.set(id);
+  sheetsAtom.set([]);
+  activeSheetIdAtom.set(remembered);
 }
 
 // --- selection ---------------------------------------------------------------
@@ -172,8 +203,6 @@ export function clearViewState() {
   columnFiltersAtom.set([]);
 }
 
-const LEGACY_VIEW_STATE_KEY = "tanstack-spreadsheet.view";
-
 function viewStateKey(sheetId: string) {
   return `tanstack-spreadsheet.view:${sheetId}`;
 }
@@ -193,14 +222,7 @@ function parseViewState(raw: string | null): PersistedViewState | null {
 
 export function loadPersistedViewState(sheetId: string): PersistedViewState | null {
   try {
-    const state = parseViewState(localStorage.getItem(viewStateKey(sheetId)));
-    if (state) return state;
-    // pre-multi-sheet installs saved a single sheet-less view; treat it as the
-    // default sheet's until the first per-sheet persist replaces it
-    if (sheetId === DEFAULT_SHEET_ID) {
-      return parseViewState(localStorage.getItem(LEGACY_VIEW_STATE_KEY));
-    }
-    return null;
+    return parseViewState(localStorage.getItem(viewStateKey(sheetId)));
   } catch {
     return null;
   }
@@ -217,9 +239,6 @@ export function persistViewState(sheetId: string) {
     } else {
       localStorage.setItem(viewStateKey(sheetId), JSON.stringify(state));
     }
-    // the per-sheet key now owns this sheet's view; drop the legacy key so a
-    // cleared view cannot resurrect from it on the next load
-    if (sheetId === DEFAULT_SHEET_ID) localStorage.removeItem(LEGACY_VIEW_STATE_KEY);
   } catch {
     // storage unavailable (private mode etc.) — the view just won't survive reloads
   }

@@ -16,11 +16,11 @@ import {
 
 import SheetTabs from "#/components/SheetTabs";
 import AccountControls from "#/components/AccountControls";
+import BookMenu from "#/components/BookMenu";
 import ThemeToggle from "#/components/ThemeToggle";
 import { activeCells, getCellsCollection, setCell } from "#/db-collections/cells";
 import { subscribeSheetSync } from "#/db-collections/server-sync";
 import { persistWidthsDebounced } from "#/db-collections/sheet-meta";
-import { initSheetsSync } from "#/db-collections/sheets";
 import { cellId, columnLabel, labelToColumnIndex, parseCellId } from "#/lib/columns";
 import { ERROR_VALUE, REF_ERROR_VALUE, displayValue } from "#/lib/formula";
 import { historyAtom, redo, runOperation, undo } from "#/lib/history";
@@ -1039,10 +1039,12 @@ function SheetGrid({ sheetId }: { sheetId: string }) {
 
   return (
     <div className="flex h-dvh flex-col bg-[var(--bg-base)]">
-      <header className="flex items-center gap-3 border-b border-[var(--line)] bg-[var(--surface-strong)] px-3 py-1.5">
-        <h1 className="text-sm font-bold tracking-tight text-[var(--palm)]">
-          tanstack-spreadsheet
-        </h1>
+      {/* relative z-50 makes the header its own stacking context above the
+          grid: the book menu and the structure dropdown hang out of it, and
+          the grid's sticky headers (z-20/30) and column menus (z-40) would
+          otherwise paint over them by DOM order. */}
+      <header className="relative z-50 flex items-center gap-3 border-b border-[var(--line)] bg-[var(--surface-strong)] px-3 py-1.5">
+        <BookMenu />
         <div className="flex gap-1.5">
           <button type="button" className={toolbarButtonClass} onClick={addRow}>
             + 行
@@ -1247,10 +1249,9 @@ function SheetGrid({ sheetId }: { sheetId: string }) {
 export default function Spreadsheet() {
   const sheetId = useSelector(activeSheetIdAtom);
 
-  // sheet list mirror + fallback when the active sheet disappears
-  useEffect(() => {
-    initSheetsSync();
-  }, []);
+  // "" until the book's sheet list arrives over the stream and the mirror
+  // picks a sheet; rendering a grid against no sheet would sync nothing
+  if (sheetId === "") return <div className="h-dvh bg-[var(--bg-base)]" />;
 
   // Remount the grid per sheet: every mount-scoped effect and hook (widths,
   // view state, live query) then naturally re-runs against the new sheet, and

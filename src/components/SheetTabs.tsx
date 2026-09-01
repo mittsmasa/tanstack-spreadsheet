@@ -1,88 +1,21 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useSelector } from "@tanstack/react-store";
 
+import InlineRename from "#/components/InlineRename";
 import { createSheetApi, deleteSheetApi, renameSheetApi } from "#/db-collections/sheets";
 import { activeSheetIdAtom, sheetsAtom, switchSheet } from "#/lib/sheet-store";
-
-import type { SheetInfo } from "#/db-collections/server-sync";
-
-// Native confirm/alert dialogs are suppressed in some embedded browsers (they
-// once made sheet rows undeletable here), so destructive actions use a
-// two-step click instead: ✕ turns into an explicit「削除?」button that
-// reverts after a timeout or an outside click.
-const DELETE_CONFIRM_MS = 3000;
+import { useDeleteConfirm } from "#/lib/use-delete-confirm";
 
 async function handleCreate() {
   const sheet = await createSheetApi();
   if (sheet) switchSheet(sheet.id);
 }
 
-function RenameInput({ sheet, onDone }: { sheet: SheetInfo; onDone: () => void }) {
-  const [value, setValue] = useState(sheet.name);
-  const [failed, setFailed] = useState(false);
-
-  const commit = async () => {
-    const trimmed = value.trim();
-    if (trimmed === sheet.name) {
-      onDone();
-      return;
-    }
-    if (trimmed !== "" && (await renameSheetApi(sheet.id, trimmed))) onDone();
-    // duplicate or empty name: keep the input open and mark it so the user
-    // can fix the name or leave via Escape
-    else setFailed(true);
-  };
-
-  return (
-    <input
-      className={`w-24 rounded border bg-[var(--surface)] px-1 py-0.5 text-xs text-[var(--sea-ink)] outline-none ${
-        failed ? "border-red-500" : "border-[var(--palm)]"
-      }`}
-      value={value}
-      autoFocus
-      title={failed ? "この名前は使えません（空・重複）" : undefined}
-      onFocus={(e) => e.currentTarget.select()}
-      onChange={(e) => {
-        setFailed(false);
-        setValue(e.target.value);
-      }}
-      onBlur={() => void commit()}
-      onKeyDown={(e) => {
-        // IME 変換確定の Enter/Escape を編集操作として扱わない
-        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-        if (e.key === "Enter") {
-          e.preventDefault();
-          void commit();
-        } else if (e.key === "Escape") {
-          e.preventDefault();
-          onDone();
-        }
-      }}
-    />
-  );
-}
-
 export default function SheetTabs() {
   const sheets = useSelector(sheetsAtom);
   const activeId = useSelector(activeSheetIdAtom);
   const [renamingId, setRenamingId] = useState<string | null>(null);
-  const [confirmingId, setConfirmingId] = useState<string | null>(null);
-
-  // revert the「削除?」state after a timeout or a click anywhere outside it
-  useEffect(() => {
-    if (confirmingId === null) return;
-    const timer = setTimeout(() => setConfirmingId(null), DELETE_CONFIRM_MS);
-    const onOutsideClick = (e: MouseEvent) => {
-      if (!(e.target instanceof Element) || !e.target.closest("[data-delete-confirm]")) {
-        setConfirmingId(null);
-      }
-    };
-    document.addEventListener("mousedown", onOutsideClick);
-    return () => {
-      clearTimeout(timer);
-      document.removeEventListener("mousedown", onOutsideClick);
-    };
-  }, [confirmingId]);
+  const [confirmingId, setConfirmingId] = useDeleteConfirm();
 
   const handleDelete = async (id: string) => {
     setConfirmingId(null);
@@ -110,7 +43,12 @@ export default function SheetTabs() {
             }`}
           >
             {renamingId === sheet.id ? (
-              <RenameInput sheet={sheet} onDone={() => setRenamingId(null)} />
+              <InlineRename
+                className="w-24"
+                value={sheet.name}
+                onCommit={(name) => renameSheetApi(sheet.id, name)}
+                onDone={() => setRenamingId(null)}
+              />
             ) : (
               <button
                 type="button"

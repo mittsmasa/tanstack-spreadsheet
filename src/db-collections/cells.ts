@@ -1,8 +1,7 @@
 import { createCollection } from "@tanstack/react-db";
 
-import { migrateLocalStorageOnce } from "#/db-collections/migrate-local-storage";
 import { subscribeSheetSync } from "#/db-collections/server-sync";
-import { DEFAULT_SHEET_ID, activeSheetIdAtom } from "#/lib/sheet-store";
+import { activeSheetIdAtom } from "#/lib/sheet-store";
 
 export type Cell = {
   /** "A1" style cell id */
@@ -44,7 +43,6 @@ function createCellsCollection(sheetId: string) {
             }
             commit();
             markReady();
-            if (sheetId === DEFAULT_SHEET_ID) void migrateLocalStorageOnce(data);
           },
           onCellChanges: (changes) => {
             begin();

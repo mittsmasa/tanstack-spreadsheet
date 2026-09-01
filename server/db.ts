@@ -1,7 +1,16 @@
 // Server-side source of truth for spreadsheet data, backed by SQLite (libsql).
 // Local default is a file DB; set LIBSQL_URL / LIBSQL_AUTH_TOKEN to point at
-// Turso instead. The `sheet` column anticipates multi-sheet support — every
-// query is already keyed by sheet, with "default" as the only sheet for now.
+// Turso instead.
+//
+// The data is three levels deep: a book owns sheets, a sheet owns cells. Only
+// `sheets` records which book it belongs to — sheet ids are UUIDs and globally
+// unique, so `cells`, `sheet_meta` and `history` stay keyed by sheet id alone.
+// Access control walks sheet -> book -> owner (see sheetAccess).
+//
+// `owner` is a Better Auth user id. Browser requests read it from the session;
+// MCP requests read it from the access token's `sub` claim, which is the same
+// user id as long as no `pairwiseSecret` is configured on the OAuth provider
+// (see server/auth.ts — adding one would break this equivalence).
 //
 // All writes go through this module in a single node process, so an in-process
 // EventEmitter is enough to fan changes out to SSE subscribers. (If the DB is
@@ -15,9 +24,9 @@ import path from "node:path";
 
 import { createClient } from "@libsql/client";
 
-export const DEFAULT_SHEET = "default";
-
 export type CellRow = { id: string; raw: string };
+
+export type Book = { id: string; name: string };
 
 export type Sheet = { id: string; name: string };
 
@@ -25,17 +34,23 @@ export type CellChange =
   | { type: "insert" | "update"; id: string; raw: string }
   | { type: "delete"; id: string };
 
+export type BookOpError = "invalid-name" | "duplicate-name" | "unknown-book" | "last-book";
+
+export type BookOpResult = { ok: true; book: Book } | { ok: false; error: BookOpError };
+
 export type SheetOpError = "invalid-name" | "duplicate-name" | "unknown-sheet" | "last-sheet";
 
 export type SheetOpResult = { ok: true; sheet: Sheet } | { ok: false; error: SheetOpError };
 
 export type ServerEvents = {
   /** committed cell changes for a sheet */
-  cells: [sheet: string, changes: Array<CellChange>];
+  cells: [book: string, sheet: string, changes: Array<CellChange>];
   /** committed column widths for a sheet */
-  meta: [sheet: string, widths: Record<string, number>];
-  /** the sheet list after a create / rename / delete */
-  sheets: [sheets: Array<Sheet>];
+  meta: [book: string, sheet: string, widths: Record<string, number>];
+  /** a book's sheet list after a create / rename / delete */
+  sheets: [book: string, sheets: Array<Sheet>];
+  /** an owner's book list after a create / rename / delete */
+  books: [owner: string, books: Array<Book>];
 };
 
 export const dbEvents = new EventEmitter<ServerEvents>();
@@ -53,79 +68,232 @@ export const client = createClient({
   authToken: process.env.LIBSQL_AUTH_TOKEN,
 });
 
-const ready = client
-  .batch(
-    [
-      `CREATE TABLE IF NOT EXISTS cells (
-      sheet TEXT NOT NULL DEFAULT 'default',
-      id TEXT NOT NULL,
-      raw TEXT NOT NULL,
-      PRIMARY KEY (sheet, id)
-    )`,
-      `CREATE TABLE IF NOT EXISTS sheet_meta (
-      sheet TEXT NOT NULL PRIMARY KEY,
-      widths TEXT NOT NULL DEFAULT '{}'
-    )`,
-      `CREATE TABLE IF NOT EXISTS sheets (
-      id TEXT NOT NULL PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE
-    )`,
-      `CREATE TABLE IF NOT EXISTS history (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT,
-      sheet TEXT NOT NULL,
-      client TEXT NOT NULL,
-      ops TEXT NOT NULL,
-      undone INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    )`,
-    ],
-    "write",
-  )
-  .then(() =>
-    // An empty sheets table means a fresh or pre-multi-sheet DB (deleting the
-    // last sheet is refused, so it can never become empty afterwards). Existing
-    // cell data already lives under sheet 'default', so seeding it as "シート1"
-    // adopts that data without any migration.
-    client.execute(
-      `INSERT INTO sheets (id, name)
-       SELECT '${DEFAULT_SHEET}', 'シート1'
-       WHERE NOT EXISTS (SELECT 1 FROM sheets)`,
-    ),
-  );
+// --- schema ------------------------------------------------------------------
 
-export async function getSheets(): Promise<Array<Sheet>> {
+/** Spreadsheet-owned tables. Better Auth's tables live in the same database
+ * and are deliberately absent from this list — the legacy reset below drops
+ * exactly these and must never touch sign-in state. */
+const OWNED_TABLES = ["history", "sheet_meta", "cells", "sheets"];
+
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS books (
+    id TEXT NOT NULL PRIMARY KEY,
+    owner TEXT NOT NULL,
+    name TEXT NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS books_owner_name ON books (owner, name)`,
+  `CREATE TABLE IF NOT EXISTS sheets (
+    id TEXT NOT NULL PRIMARY KEY,
+    book TEXT NOT NULL,
+    name TEXT NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS sheets_book_name ON sheets (book, name)`,
+  `CREATE TABLE IF NOT EXISTS cells (
+    sheet TEXT NOT NULL,
+    id TEXT NOT NULL,
+    raw TEXT NOT NULL,
+    PRIMARY KEY (sheet, id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS sheet_meta (
+    sheet TEXT NOT NULL PRIMARY KEY,
+    widths TEXT NOT NULL DEFAULT '{}'
+  )`,
+  `CREATE TABLE IF NOT EXISTS history (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    sheet TEXT NOT NULL,
+    client TEXT NOT NULL,
+    ops TEXT NOT NULL,
+    undone INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  )`,
+];
+
+/**
+ * Pre-book databases have a `sheets` table without a `book` column, and their
+ * sheet names carry a global UNIQUE that has to become per-book. SQLite cannot
+ * drop a column constraint, and the project decided not to migrate the data,
+ * so the spreadsheet tables are rebuilt from scratch. Both halves run in one
+ * transaction so a crash can never leave a half-dropped schema behind.
+ */
+async function resetLegacySchema(): Promise<void> {
+  // PRAGMA on a missing table returns no rows rather than failing, so this
+  // doubles as the "is this a fresh database" check.
+  const columns = await client.execute("PRAGMA table_info(sheets)");
+  if (columns.rows.length === 0) return;
+  if (columns.rows.some((row) => String(row.name) === "book")) return;
+
+  console.warn(
+    `[db] pre-book schema detected — rebuilding ${OWNED_TABLES.join(", ")}. ` +
+      "Existing sheets and cells are discarded; sign-in state is untouched.",
+  );
+  await client.batch(
+    [...OWNED_TABLES.map((table) => `DROP TABLE IF EXISTS ${table}`), ...SCHEMA],
+    "write",
+  );
+}
+
+const ready = (async () => {
+  await resetLegacySchema();
+  await client.batch(SCHEMA, "write");
+})();
+
+// --- books -------------------------------------------------------------------
+
+export async function getBooks(owner: string): Promise<Array<Book>> {
   await ready;
-  const result = await client.execute("SELECT id, name FROM sheets ORDER BY rowid");
+  const result = await client.execute({
+    sql: "SELECT id, name FROM books WHERE owner = ? ORDER BY rowid",
+    args: [owner],
+  });
   return result.rows.map((row) => ({ id: String(row.id), name: String(row.name) }));
 }
 
-export async function sheetExists(sheet: string): Promise<boolean> {
+/** The book's owner, or null when no such book exists. Callers compare this
+ * against the requesting user and answer 404 on a mismatch. */
+export async function bookOwner(id: string): Promise<string | null> {
   await ready;
   const result = await client.execute({
-    sql: "SELECT 1 FROM sheets WHERE id = ?",
-    args: [sheet],
+    sql: "SELECT owner FROM books WHERE id = ?",
+    args: [id],
   });
-  return result.rows.length > 0;
+  const row = result.rows[0];
+  return row === undefined ? null : String(row.owner);
 }
 
-async function emitSheets() {
-  dbEvents.emit("sheets", await getSheets());
+/** The book and owner a sheet belongs to, or null when no such sheet exists. */
+export async function sheetAccess(sheet: string): Promise<{ book: string; owner: string } | null> {
+  await ready;
+  const result = await client.execute({
+    sql: `SELECT sheets.book AS book, books.owner AS owner
+          FROM sheets JOIN books ON books.id = sheets.book
+          WHERE sheets.id = ?`,
+    args: [sheet],
+  });
+  const row = result.rows[0];
+  return row === undefined ? null : { book: String(row.book), owner: String(row.owner) };
+}
+
+async function emitBooks(owner: string) {
+  dbEvents.emit("books", owner, await getBooks(owner));
+}
+
+/** Pick the first free "{prefix}{N}" among names already taken. */
+function autoName(prefix: string, taken: ReadonlySet<string>, start: number): string {
+  let n = start;
+  while (taken.has(`${prefix}${n}`)) n++;
+  return `${prefix}${n}`;
 }
 
 /**
- * Create a sheet. Without a name, picks the first free "シート{N}". An explicit
- * name must be non-empty and unique (the UNIQUE constraint is checked up front
- * so callers can map the failure to a proper error instead of a raw SQL error).
+ * Create a book for an owner, along with the one sheet it starts with (a book
+ * with no sheets has no valid UI state). Without a name, picks the first free
+ * "ブック{N}" for that owner. Names are unique per owner, checked up front so
+ * callers get a proper error instead of a raw constraint failure.
  */
-export async function createSheet(name?: string): Promise<SheetOpResult> {
+export async function createBook(owner: string, name?: string): Promise<BookOpResult> {
   await ready;
-  const sheets = await getSheets();
+  const books = await getBooks(owner);
+  const names = new Set(books.map((b) => b.name));
+  let resolved: string;
+  if (name === undefined) {
+    resolved = autoName("ブック", names, books.length + 1);
+  } else {
+    resolved = name.trim();
+    if (resolved === "") return { ok: false, error: "invalid-name" };
+    if (names.has(resolved)) return { ok: false, error: "duplicate-name" };
+  }
+  const book: Book = { id: randomUUID(), name: resolved };
+  await client.batch(
+    [
+      {
+        sql: "INSERT INTO books (id, owner, name) VALUES (?, ?, ?)",
+        args: [book.id, owner, book.name],
+      },
+      {
+        sql: "INSERT INTO sheets (id, book, name) VALUES (?, ?, ?)",
+        args: [randomUUID(), book.id, "シート1"],
+      },
+    ],
+    "write",
+  );
+  await emitBooks(owner);
+  return { ok: true, book };
+}
+
+export async function renameBook(owner: string, id: string, name: string): Promise<BookOpResult> {
+  await ready;
+  const resolved = name.trim();
+  if (resolved === "") return { ok: false, error: "invalid-name" };
+  const books = await getBooks(owner);
+  const target = books.find((b) => b.id === id);
+  if (!target) return { ok: false, error: "unknown-book" };
+  if (books.some((b) => b.id !== id && b.name === resolved)) {
+    return { ok: false, error: "duplicate-name" };
+  }
+  await client.execute({
+    sql: "UPDATE books SET name = ? WHERE id = ?",
+    args: [resolved, id],
+  });
+  await emitBooks(owner);
+  return { ok: true, book: { id, name: resolved } };
+}
+
+/**
+ * Delete a book and everything under it. The "keep at least one book" guard
+ * runs inside a single conditional DELETE so concurrent deletes (two tabs at
+ * once) cannot race the count check and leave the owner with none. The child
+ * rows are removed before the sheets they are selected through.
+ */
+export async function deleteBook(owner: string, id: string): Promise<BookOpResult> {
+  await ready;
+  const books = await getBooks(owner);
+  const target = books.find((b) => b.id === id);
+  if (!target) return { ok: false, error: "unknown-book" };
+  const result = await client.execute({
+    sql: "DELETE FROM books WHERE id = ? AND (SELECT COUNT(*) FROM books WHERE owner = ?) > 1",
+    args: [id, owner],
+  });
+  if (result.rowsAffected === 0) return { ok: false, error: "last-book" };
+  const ofBook = "SELECT id FROM sheets WHERE book = ?";
+  await client.batch(
+    [
+      { sql: `DELETE FROM cells WHERE sheet IN (${ofBook})`, args: [id] },
+      { sql: `DELETE FROM sheet_meta WHERE sheet IN (${ofBook})`, args: [id] },
+      { sql: `DELETE FROM history WHERE sheet IN (${ofBook})`, args: [id] },
+      { sql: "DELETE FROM sheets WHERE book = ?", args: [id] },
+    ],
+    "write",
+  );
+  await emitBooks(owner);
+  return { ok: true, book: target };
+}
+
+// --- sheets ------------------------------------------------------------------
+
+export async function getSheets(book: string): Promise<Array<Sheet>> {
+  await ready;
+  const result = await client.execute({
+    sql: "SELECT id, name FROM sheets WHERE book = ? ORDER BY rowid",
+    args: [book],
+  });
+  return result.rows.map((row) => ({ id: String(row.id), name: String(row.name) }));
+}
+
+async function emitSheets(book: string) {
+  dbEvents.emit("sheets", book, await getSheets(book));
+}
+
+/**
+ * Create a sheet in a book. Without a name, picks the first free "シート{N}"
+ * within that book. Names are unique per book.
+ */
+export async function createSheet(book: string, name?: string): Promise<SheetOpResult> {
+  await ready;
+  const sheets = await getSheets(book);
   const names = new Set(sheets.map((s) => s.name));
   let resolved: string;
   if (name === undefined) {
-    let n = sheets.length + 1;
-    while (names.has(`シート${n}`)) n++;
-    resolved = `シート${n}`;
+    resolved = autoName("シート", names, sheets.length + 1);
   } else {
     resolved = name.trim();
     if (resolved === "") return { ok: false, error: "invalid-name" };
@@ -133,18 +301,18 @@ export async function createSheet(name?: string): Promise<SheetOpResult> {
   }
   const sheet: Sheet = { id: randomUUID(), name: resolved };
   await client.execute({
-    sql: "INSERT INTO sheets (id, name) VALUES (?, ?)",
-    args: [sheet.id, sheet.name],
+    sql: "INSERT INTO sheets (id, book, name) VALUES (?, ?, ?)",
+    args: [sheet.id, book, sheet.name],
   });
-  await emitSheets();
+  await emitSheets(book);
   return { ok: true, sheet };
 }
 
-export async function renameSheet(id: string, name: string): Promise<SheetOpResult> {
+export async function renameSheet(book: string, id: string, name: string): Promise<SheetOpResult> {
   await ready;
   const resolved = name.trim();
   if (resolved === "") return { ok: false, error: "invalid-name" };
-  const sheets = await getSheets();
+  const sheets = await getSheets(book);
   const target = sheets.find((s) => s.id === id);
   if (!target) return { ok: false, error: "unknown-sheet" };
   if (sheets.some((s) => s.id !== id && s.name === resolved)) {
@@ -154,23 +322,23 @@ export async function renameSheet(id: string, name: string): Promise<SheetOpResu
     sql: "UPDATE sheets SET name = ? WHERE id = ?",
     args: [resolved, id],
   });
-  await emitSheets();
+  await emitSheets(book);
   return { ok: true, sheet: { id, name: resolved } };
 }
 
 /**
  * Delete a sheet and its data. The "keep at least one sheet" guard runs inside
  * a single conditional DELETE so concurrent deletes (two tabs at once) cannot
- * race the count check and empty the table.
+ * race the count check and empty the book.
  */
-export async function deleteSheet(id: string): Promise<SheetOpResult> {
+export async function deleteSheet(book: string, id: string): Promise<SheetOpResult> {
   await ready;
-  const sheets = await getSheets();
+  const sheets = await getSheets(book);
   const target = sheets.find((s) => s.id === id);
   if (!target) return { ok: false, error: "unknown-sheet" };
   const result = await client.execute({
-    sql: "DELETE FROM sheets WHERE id = ? AND (SELECT COUNT(*) FROM sheets) > 1",
-    args: [id],
+    sql: "DELETE FROM sheets WHERE id = ? AND (SELECT COUNT(*) FROM sheets WHERE book = ?) > 1",
+    args: [id, book],
   });
   if (result.rowsAffected === 0) return { ok: false, error: "last-sheet" };
   await client.batch(
@@ -181,11 +349,13 @@ export async function deleteSheet(id: string): Promise<SheetOpResult> {
     ],
     "write",
   );
-  await emitSheets();
+  await emitSheets(book);
   return { ok: true, sheet: target };
 }
 
-export async function getCells(sheet = DEFAULT_SHEET): Promise<Array<CellRow>> {
+// --- cells -------------------------------------------------------------------
+
+export async function getCells(sheet: string): Promise<Array<CellRow>> {
   await ready;
   const result = await client.execute({
     sql: "SELECT id, raw FROM cells WHERE sheet = ?",
@@ -207,11 +377,12 @@ export async function getCells(sheet = DEFAULT_SHEET): Promise<Array<CellRow>> {
  */
 export async function applyCellMutations(
   cells: ReadonlyArray<CellRow>,
-  sheet = DEFAULT_SHEET,
+  sheet: string,
   recordFor?: string,
 ): Promise<Array<CellChange>> {
   await ready;
-  if (!(await sheetExists(sheet))) throw new Error(`unknown sheet: ${sheet}`);
+  const access = await sheetAccess(sheet);
+  if (!access) throw new Error(`unknown sheet: ${sheet}`);
   const existing = new Map<string, string>();
   const current = await client.execute({
     sql: "SELECT id, raw FROM cells WHERE sheet = ?",
@@ -253,7 +424,7 @@ export async function applyCellMutations(
   if (statements.length > 0) {
     await client.batch(statements, "write");
     if (recordFor !== undefined) await recordHistoryEntry(sheet, recordFor, ops);
-    dbEvents.emit("cells", sheet, changes);
+    dbEvents.emit("cells", access.book, sheet, changes);
   }
   return changes;
 }
@@ -355,7 +526,9 @@ export async function applyHistory(
   return { applied: changes.length, ...(await historyState(sheet, client_)) };
 }
 
-export async function getWidths(sheet = DEFAULT_SHEET): Promise<Record<string, number>> {
+// --- column widths -----------------------------------------------------------
+
+export async function getWidths(sheet: string): Promise<Record<string, number>> {
   await ready;
   const result = await client.execute({
     sql: "SELECT widths FROM sheet_meta WHERE sheet = ?",
@@ -373,11 +546,9 @@ export async function getWidths(sheet = DEFAULT_SHEET): Promise<Record<string, n
 
 /** Persist column widths. Identical writes are dropped, which also breaks the
  * client echo loop (atom subscribe → persist → SSE → atom set → persist…). */
-export async function setWidths(
-  widths: Record<string, number>,
-  sheet = DEFAULT_SHEET,
-): Promise<void> {
-  if (!(await sheetExists(sheet))) throw new Error(`unknown sheet: ${sheet}`);
+export async function setWidths(widths: Record<string, number>, sheet: string): Promise<void> {
+  const access = await sheetAccess(sheet);
+  if (!access) throw new Error(`unknown sheet: ${sheet}`);
   const current = await getWidths(sheet);
   const next = JSON.stringify(widths);
   if (JSON.stringify(current) === next) return;
@@ -386,5 +557,5 @@ export async function setWidths(
           ON CONFLICT(sheet) DO UPDATE SET widths = excluded.widths`,
     args: [sheet, next],
   });
-  dbEvents.emit("meta", sheet, widths);
+  dbEvents.emit("meta", access.book, sheet, widths);
 }

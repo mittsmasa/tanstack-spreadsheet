@@ -49,6 +49,7 @@ async function fetchState(sheet: string) {
  */
 export function runOperation(mutate: () => void) {
   const sheet = activeSheetIdAtom.get();
+  if (sheet === "") return;
   const tx = createTransaction<Cell>({
     mutationFn: async ({ transaction }) => {
       const cells = transaction.mutations.map((m) =>
@@ -75,6 +76,7 @@ export function runOperation(mutate: () => void) {
 async function applyHistoryOp(direction: "undo" | "redo") {
   stopEditing();
   const sheet = activeSheetIdAtom.get();
+  if (sheet === "") return;
   try {
     const res = await fetch(`/api/history/${direction}`, {
       method: "POST",
@@ -102,20 +104,22 @@ export function redo() {
 
 if (typeof window !== "undefined") {
   let unwatch: (() => void) | null = null;
+  // "" means no sheet is active yet (the book's list has not arrived, or the
+  // tab is between books) — there is nothing to watch or ask about.
   const watch = (sheet: string) => {
     unwatch?.();
+    unwatch = null;
+    if (sheet === "") return;
     unwatch = subscribeSheetSync(sheet, {
       onSnapshot: () => void fetchState(sheet),
       onCellChanges: () => void fetchState(sheet),
     });
+    void fetchState(sheet);
   };
-  watch(activeSheetIdAtom.get());
   activeSheetIdAtom.subscribe(() => {
-    const sheet = activeSheetIdAtom.get();
     // per-sheet state: blank the buttons until the new sheet's state arrives
     historyAtom.set({ canUndo: false, canRedo: false });
-    watch(sheet);
-    void fetchState(sheet);
+    watch(activeSheetIdAtom.get());
   });
-  void fetchState(activeSheetIdAtom.get());
+  watch(activeSheetIdAtom.get());
 }

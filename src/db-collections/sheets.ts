@@ -1,10 +1,10 @@
 // Sheet CRUD against the dev server + the client-side mirror of the sheet
-// list. There is no react-db collection here — the list is small, changes are
-// rare, and the server broadcasts the full list on every change, so an atom
-// fed by the shared SSE stream is enough.
+// list for the active book. There is no react-db collection here — the list is
+// small, changes are rare, and the server broadcasts the full list on every
+// change, so an atom fed by the shared SSE stream is enough.
 
 import { subscribeSheetsList } from "#/db-collections/server-sync";
-import { activeSheetIdAtom, sheetsAtom, switchSheet } from "#/lib/sheet-store";
+import { activeBookIdAtom, activeSheetIdAtom, sheetsAtom, switchSheet } from "#/lib/sheet-store";
 
 import type { SheetInfo } from "#/db-collections/server-sync";
 
@@ -13,7 +13,10 @@ export async function createSheetApi(name?: string): Promise<SheetInfo | null> {
     const res = await fetch("/api/sheets", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(name === undefined ? {} : { name }),
+      body: JSON.stringify({
+        book: activeBookIdAtom.get(),
+        ...(name === undefined ? {} : { name }),
+      }),
     });
     if (!res.ok) return null;
     const body = (await res.json()) as { sheet?: SheetInfo };
@@ -47,15 +50,16 @@ export async function deleteSheetApi(id: string): Promise<boolean> {
 
 let started = false;
 
-/** Mirror the server's sheet list into sheetsAtom (browser only, idempotent).
- * When the active sheet disappears — deleted from another tab or via MCP, or a
- * stale id restored from localStorage — falls back to the first sheet. */
+/** Mirror the active book's sheet list into sheetsAtom (browser only,
+ * idempotent). When the active sheet is not in the list — nothing remembered
+ * for this book yet, a stale id from localStorage, or a sheet deleted from
+ * another tab or via MCP — falls back to the first sheet. */
 export function initSheetsSync() {
   if (started || typeof window === "undefined") return;
   started = true;
   subscribeSheetsList((sheets) => {
-    const known = new Set(sheets.map((sheet) => sheet.id));
     sheetsAtom.set(sheets);
+    const known = new Set(sheets.map((sheet) => sheet.id));
     const first = sheets[0];
     if (first && !known.has(activeSheetIdAtom.get())) switchSheet(first.id);
   });

@@ -14,3 +14,7 @@ todos.json
 
 # server-side SQLite data (spreadsheet SSoT)
 data
+
+# storybook build output
+storybook-static
+*storybook.log

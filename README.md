@@ -110,6 +110,31 @@ claude mcp add --transport http tanstack-spreadsheet http://localhost:3210/mcp
 
 行・列の挿入・削除などの構造操作ツールは未実装（第 2 段の予定）。
 
+# テスト
+
+vitest を 3 つの project に分けている。どれで動くかはファイル名で決まる。
+
+| project     | 環境                            | 対象                                    | ファイル名      |
+| ----------- | ------------------------------- | --------------------------------------- | --------------- |
+| `node`      | node                            | 純粋関数・ストアのロジック（`src/lib`） | `*.test.ts`     |
+| `db`        | node + libsql `:memory:`        | `server/db.ts` の DB 操作               | `*.db.test.ts`  |
+| `storybook` | chromium（vitest browser mode） | コンポーネントの stories + play         | `*.stories.tsx` |
+
+```bash
+pnpm test              # 3 project すべて
+pnpm test:node
+pnpm test:db
+pnpm test:storybook    # 初回は pnpm exec playwright install chromium
+pnpm storybook         # Storybook を http://localhost:6006 で起動
+```
+
+## 書き方の方針
+
+- **ビジネスロジックは純粋関数に切り出して `node` で書く。** DOM もサーバーも要らない形にしてからテストする（例: `src/lib/index-map.ts`）
+- **DB に触る処理は `db` で書く。** `LIBSQL_URL=:memory:` で動き、vitest がファイルごとに module graph を分けるので、テストファイル単位で新品の DB になる。ファイル内は owner や book を test ごとに作って分離する
+- **コンポーネントは View と container に分けて、View に stories を書く。** View は props だけを受け取り（表示に要るデータと、起きたことを伝えるコールバック）、atom や fetch との接続は container が持つ。stories からは View だけを import するので、fetch や better-auth を mock する必要がない。コールバックには `fn()` を渡して play で呼び出しを確かめる
+- `vitest.config.ts` は `vite.config.ts` を継承しない。あちらは `server/plugin.ts` 経由で SQLite を開くので、テスト起動のたびに `data/spreadsheet.db` が作られてしまう。Storybook も同じ理由で `.storybook/vite.config.ts` を使う
+
 # Building For Production
 
 To build this application for production:

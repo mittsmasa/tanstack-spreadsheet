@@ -6,14 +6,15 @@ To run this application:
 
 ```bash
 pnpm install
+pnpm db:migrate   # ローカル D1 にスキーマを当てる（初回と migration 追加時）
 pnpm dev
 ```
 
-初回は認証のセットアップが必要（下記）。
+初回は認証のセットアップが必要（下記）。アプリは Cloudflare Workers 上で動く前提で、ローカルでは `pnpm dev` が workerd（miniflare）で Worker を動かす。本番へは「Deploy」の節を参照。
 
 # 認証
 
-Better Auth による Google ログイン必須。未ログインではログイン画面だけが表示され、`/api/*` と SSE は 401、`/mcp` は OAuth のチャレンジを返す。
+Better Auth による Google ログイン必須。未ログインではログイン画面だけが表示され、`/api/*` と WebSocket (`/api/stream`) は 401、`/mcp` は OAuth のチャレンジを返す。
 
 ## セットアップ
 
@@ -30,24 +31,25 @@ security add-generic-password -s fnox -a age-key -w '<AGE-SECRET-KEY-...>' -U
 
 ```bash
 openssl rand -base64 32 | fnox --no-daemon set BETTER_AUTH_SECRET
-printf 'http://localhost:3210' | fnox --no-daemon set BETTER_AUTH_URL
 fnox --no-daemon set GOOGLE_CLIENT_ID
 fnox --no-daemon set GOOGLE_CLIENT_SECRET
 ```
 
 **`--no-daemon` は必須。**付けないと `✓ Set secret` と表示されるのに書き込まれず、あとで `not found` になる（fnox 1.32.0 で確認）。
 
-6. auth 用テーブルを作る（スプレッドシートと同じ DB ファイルに同居する）
+6. ローカル D1 にスキーマを当てる（auth のテーブルもスプレッドシートと同じ D1 に同居する）
 
 ```bash
-pnpm auth:migrate
+pnpm db:migrate
 ```
 
 ## 設定の持ち方
 
 暗号化された値は `fnox.toml` に直接入っていて、復号できるのは age 秘密鍵を持つ人だけ。その鍵は OS keychain にあり、リポジトリには含まれない。age プロバイダの `identity = { provider = "keychain", value = "age-key" }` が keychain から鍵を取り出すので、事前に環境変数を用意する必要はない。
 
-`dev` / `build` / `preview` / `auth:migrate` は `fnox exec` を内包しているので、`pnpm dev` などをそのまま叩けばよい。`vite.config.ts` が `server/auth.ts` を読むため、**build でも設定が必要**。
+`pnpm dev` は先に `scripts/dev-vars.sh` を実行し、fnox から `BETTER_AUTH_SECRET` / `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を取り出して `.dev.vars`（gitignore 済み、owner のみ読める）に書く。Cloudflare の Vite plugin がこれを Worker の secrets として読み込む。`BETTER_AUTH_URL` はローカルでは `http://localhost:3210` を同スクリプトが書き、本番では `wrangler.jsonc` の `vars` が持つ。`pnpm build` に設定は要らない。
+
+本番の secrets は fnox ではなく `wrangler secret put` で Cloudflare に置く（Deploy の節）。
 
 fnox 本体は `mise.toml` が固定する（npm パッケージではなく mise 経由で入る）。
 
@@ -55,15 +57,15 @@ fnox 本体は `mise.toml` が固定する（npm パッケージではなく mis
 
 ## 仕組み
 
-- auth のルートは vite plugin の middleware が `/api/auth/*` にマウントする（`server/plugin.ts`）。ブラウザ向けはセッション Cookie、`/mcp` は OAuth の bearer トークンで検証する
-- auth のテーブルは `server/db.ts` の libsql クライアントを共有するので、`LIBSQL_URL` で Turso に切り替えればそちらへ一緒に移る
+- auth のルートは Worker の `server/api.ts` が `/api/auth/*` を `auth.handler` に渡す。ブラウザ向けはセッション Cookie、`/mcp` は OAuth の bearer トークンで検証する
+- auth のテーブルは D1 binding `DB` をそのまま Better Auth に渡して同居させる。スキーマは `migrations/0001_auth.sql` にあり、`pnpm auth:generate`（`server/auth.cli.ts` を Node の `node:sqlite` in-memory DB で読む）が生成する。Better Auth を上げてスキーマが変わったら、再生成した差分を新しい migration ファイルに切る
 - `/consent` は MCP クライアントの認可を承認する画面。ブラウザから直接開くものではない
 
 # Storage & MCP
 
 ## データの保存先
 
-スプレッドシートのデータ（ブック・シート・セル・列幅）の SSoT は dev server 内の SQLite（libsql）で、既定では `data/spreadsheet.db`（gitignore 済み）に保存される。ブラウザ側の collection はカスタム sync によるミラー（シートごとに 1 collection）で、タブ間同期は SSE（`/api/stream`）経由。**アプリの利用には dev server（`pnpm dev`）または preview server が必要。**
+スプレッドシートのデータ（ブック・シート・セル・列幅）の SSoT は Cloudflare D1（SQLite）。ローカルでは miniflare が `.wrangler/state/`（gitignore 済み）に持つローカル D1 を使い、`pnpm db:migrate` で `migrations/*.sql` を当てる。ブラウザ側の collection はカスタム sync によるミラー（シートごとに 1 collection）で、タブ間同期は WebSocket（`/api/stream`）経由。接続はユーザーごとの Durable Object `SyncHub` が束ね、`server/db.ts` の書き込みが確定するたびにそこへ配信する。
 
 ## ブックとシート
 
@@ -78,12 +80,12 @@ fnox 本体は `mise.toml` が固定する（npm パッケージではなく mis
 
 `cells` / `sheet_meta` / `history` はシート id だけで引く（シート id は UUID でグローバルに一意）。ブックの所属を持つのは `sheets` テーブルだけで、権限判定は シート → ブック → owner と辿る。
 
-- `LIBSQL_URL` / `LIBSQL_AUTH_TOKEN` を設定すると Turso など外部の libsql に切替できる。ただし変更通知は同一プロセス内の書き込みしか拾わないため、外部から直接 DB に書いた変更をブラウザへ即時反映するにはポーリング等の追加実装が必要（将来課題）
-- **ブック導入より前の DB は起動時に作り直される。** `sheets` に `book` 列が無い DB を見つけると、`cells` / `sheets` / `sheet_meta` / `history` を drop して新スキーマで作り直す（何を消すかは起動ログに出る）。**既存のシートとセルは失われる。** ログイン状態は無事で、Better Auth のテーブルには触らない
+- スキーマは `migrations/` の SQL で管理する（`0001_auth.sql` は生成物、`0002_spreadsheet.sql` は手書き）。変更は新しい番号のファイルを足し、ローカルは `pnpm db:migrate`、本番は `pnpm db:migrate:remote` で当てる
+- 変更通知は `server/db.ts` を通った書き込みしか拾わない。`wrangler d1 execute` などで直接 D1 に書いた変更は、次の snapshot（タブの再接続）まで開いているタブには届かない
 
 ## MCP サーバー
 
-dev server が `http://localhost:3210/mcp` に MCP エンドポイント（streamable HTTP）をホストする。Claude Code からの登録:
+Worker が `/mcp` に MCP エンドポイント（streamable HTTP）をホストする。ローカルは `http://localhost:3210/mcp`、本番は `https://<worker>/mcp`。Claude Code からの登録:
 
 ```bash
 claude mcp add --transport http tanstack-spreadsheet http://localhost:3210/mcp
@@ -117,7 +119,7 @@ vitest を 3 つの project に分けている。どれで動くかはファイ�
 | project     | 環境                            | 対象                                    | ファイル名      |
 | ----------- | ------------------------------- | --------------------------------------- | --------------- |
 | `node`      | node                            | 純粋関数・ストアのロジック（`src/lib`） | `*.test.ts`     |
-| `db`        | node + libsql `:memory:`        | `server/db.ts` の DB 操作               | `*.db.test.ts`  |
+| `db`        | workerd + ローカル D1           | `server/db.ts` の DB 操作               | `*.db.test.ts`  |
 | `storybook` | chromium（vitest browser mode） | コンポーネントの stories + play         | `*.stories.tsx` |
 
 ```bash
@@ -131,17 +133,57 @@ pnpm storybook         # Storybook を http://localhost:6006 で起動
 ## 書き方の方針
 
 - **ビジネスロジックは純粋関数に切り出して `node` で書く。** DOM もサーバーも要らない形にしてからテストする（例: `src/lib/index-map.ts`）
-- **DB に触る処理は `db` で書く。** `LIBSQL_URL=:memory:` で動き、vitest がファイルごとに module graph を分けるので、テストファイル単位で新品の DB になる。ファイル内は owner や book を test ごとに作って分離する
+- **DB に触る処理は `db` で書く。** `@cloudflare/vitest-plugin` が Workers runtime (workerd) の中でテストを動かし、`server/test/apply-migrations.ts` が `migrations/*.sql` を当てた D1 を用意する。plugin がテストごとにストレージを隔離するので、テストファイル単位で新品の DB になる。ファイル内は owner や book を test ごとに作って分離する。変更通知は `sync.publish` を差し替えて記録する (Durable Object は使わない)
 - **コンポーネントは View と container に分けて、View に stories を書く。** View は props だけを受け取り（表示に要るデータと、起きたことを伝えるコールバック）、atom や fetch との接続は container が持つ。stories からは View だけを import するので、fetch や better-auth を mock する必要がない。コールバックには `fn()` を渡して play で呼び出しを確かめる
-- `vitest.config.ts` は `vite.config.ts` を継承しない。あちらは `server/plugin.ts` 経由で SQLite を開くので、テスト起動のたびに `data/spreadsheet.db` が作られてしまう。Storybook も同じ理由で `.storybook/vite.config.ts` を使う
+- `vitest.config.ts` は `vite.config.ts` を継承しない。あちらはアプリ全体を Cloudflare plugin で動かす設定で、テストには要らない。Storybook も同じ理由で `.storybook/vite.config.ts` を使う
 
 # Building For Production
 
-To build this application for production:
+```bash
+pnpm build      # dist/client (静的アセット) と dist/server (Worker) を出す
+pnpm cf-typegen # wrangler.jsonc / .dev.vars から worker-configuration.d.ts を生成（type-check の前に）
+```
+
+# Deploy
+
+Cloudflare Workers + D1 + Durable Objects で動く。設定は `wrangler.jsonc`。
+
+初回だけ:
+
+1. `pnpm exec wrangler login`
+2. `pnpm exec wrangler d1 create tanstack-spreadsheet` を実行し、表示された `database_id` を `wrangler.jsonc` の `d1_databases[0].database_id` に入れる
+3. `wrangler.jsonc` の `vars.BETTER_AUTH_URL` を本番の URL（`https://tanstack-spreadsheet.<account>.workers.dev`）にする
+4. secrets を Cloudflare に置く（値は `fnox get <KEY>` で取り出す）
 
 ```bash
-pnpm build
+pnpm exec wrangler secret put BETTER_AUTH_SECRET
+pnpm exec wrangler secret put GOOGLE_CLIENT_ID
+pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET
 ```
+
+5. Google Cloud Console の承認済みリダイレクト URI に `https://<worker>/api/auth/callback/google` を追加する
+
+毎回:
+
+```bash
+pnpm db:migrate:remote  # migrations/ に未適用のものがあれば
+pnpm deploy             # build + wrangler deploy
+```
+
+Durable Object の `SyncHub` は SQLite バックエンド（無料プランで可）。WebSocket Hibernation を使うので、タブを開いたまま放置しても DO は課金されない。
+
+## 自動デプロイ
+
+`main` に push されると `.github/workflows/deploy.yml` が `pnpm db:migrate:remote` → `pnpm build` → `wrangler deploy` の順に流す。手元の `pnpm deploy` と同じことを CI がやるだけなので、手動デプロイも引き続き使える。
+
+初回だけ GitHub の repository secrets を 2 つ入れる:
+
+| secret                  | 値                                                                                                                                                                         |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLOUDFLARE_ACCOUNT_ID` | `pnpm exec wrangler whoami` に出る Account ID                                                                                                                              |
+| `CLOUDFLARE_API_TOKEN`  | [API トークン](https://dash.cloudflare.com/profile/api-tokens) を「Edit Cloudflare Workers」テンプレートから作り、権限に **D1 - Edit** を足す。アカウントはこの 1 つに絞る |
+
+secrets が無いまま main に push すると Deploy ワークフローは認証エラーで落ちる（本番は変わらない）。
 
 ## Styling
 

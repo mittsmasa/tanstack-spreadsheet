@@ -1,12 +1,6 @@
-savePrefix: ''
+savePrefix: ""
 
 allowBuilds:
   esbuild: true
   lightningcss: true
-
-overrides:
-  # @libsql/kysely-libsql still asks for @libsql/client ^0.8, which would put a
-  # second copy of the client types in the tree and make the client we hand the
-  # dialect (server/auth.ts) unassignable. We only use the dialect with our own
-  # client instance, so pinning it to ours is enough.
-  "@libsql/client": "0.17.4"
+  workerd: true

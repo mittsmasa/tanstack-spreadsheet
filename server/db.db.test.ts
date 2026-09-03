@@ -1,12 +1,15 @@
-// Runs in the "db" vitest project: LIBSQL_URL is ":memory:" there, and vitest
-// isolates this file in its own module graph, so the client below opens a
-// database nobody else touches. Tests keep out of each other's way by owning
-// distinct users (every id below is a fresh UUID), which is also how the real
-// app scopes data.
+// Runs in the "db" vitest project, inside the Workers runtime against a local
+// D1 that server/test/apply-migrations.ts has prepared. The plugin isolates
+// storage per test, and tests additionally keep out of each other's way by
+// owning distinct users (every id below is a fresh UUID), which is also how
+// the real app scopes data.
+//
+// Change notifications normally go to the owner's SyncHub Durable Object;
+// here `sync.publish` is swapped for a recorder so no Durable Object is needed.
 
 import { randomUUID } from "node:crypto";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   applyCellMutations,
@@ -14,7 +17,6 @@ import {
   bookOwner,
   createBook,
   createSheet,
-  dbEvents,
   deleteBook,
   deleteSheet,
   getBooks,
@@ -26,28 +28,55 @@ import {
   renameSheet,
   setWidths,
   sheetAccess,
+  sync,
 } from "./db";
 
-import type { Book, ServerEvents, Sheet } from "./db";
+import type { Book, CellChange, ServerEvent, Sheet } from "./db";
 
 // --- helpers -----------------------------------------------------------------
 
-const stops: Array<() => void> = [];
+/** One published event, flattened to the tuple shape subscribers care about:
+ * where it happened and what changed. */
+type Captured = {
+  cells: [book: string, sheet: string, changes: Array<CellChange>];
+  meta: [book: string, sheet: string, widths: Record<string, number>];
+  sheets: [book: string, sheets: Array<Sheet>];
+  books: [owner: string, books: Array<Book>];
+};
 
-afterEach(() => {
-  for (const stop of stops.splice(0)) stop();
+function flatten(owner: string, event: ServerEvent): Captured[keyof Captured] {
+  switch (event.event) {
+    case "cells":
+      return [event.book, event.data.sheet, event.data.changes];
+    case "meta":
+      return [event.book, event.data.sheet, event.data.widths];
+    case "sheets":
+      return [event.book, event.data.sheets];
+    case "books":
+      return [owner, event.data.books];
+  }
+}
+
+const captures: Array<{ kind: keyof Captured; calls: Array<Captured[keyof Captured]> }> = [];
+const realPublish = sync.publish;
+
+beforeEach(() => {
+  captures.length = 0;
+  sync.publish = async (owner, event) => {
+    for (const { kind, calls } of captures) {
+      if (kind === event.event) calls.push(flatten(owner, event));
+    }
+  };
 });
 
-/** Record every emission of one server event until the test ends. */
-function capture<K extends keyof ServerEvents>(event: K): Array<ServerEvents[K]> {
-  const calls: Array<ServerEvents[K]> = [];
-  // EventEmitter's listener type is conditional on the event key, which a
-  // generic K cannot satisfy directly; the instantiation pins it down.
-  const listener = ((...args: ServerEvents[K]) => {
-    calls.push(args);
-  }) as Parameters<typeof dbEvents.on<K>>[1];
-  dbEvents.on(event, listener);
-  stops.push(() => dbEvents.off(event, listener));
+afterEach(() => {
+  sync.publish = realPublish;
+});
+
+/** Record every publish of one event kind from now until the test ends. */
+function capture<K extends keyof Captured>(kind: K): Array<Captured[K]> {
+  const calls: Array<Captured[K]> = [];
+  captures.push({ kind, calls });
   return calls;
 }
 

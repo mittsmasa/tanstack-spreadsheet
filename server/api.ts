@@ -27,15 +27,15 @@
 // handleApi returns null for anything it does not own so the Worker entry can
 // fall through to the Start handler.
 
-import { requireMcpAuth } from "@better-auth/mcp";
 import { env } from "cloudflare:workers";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { verifyJwsAccessToken } from "better-auth/oauth2";
 
 import { cellId, parseCellId } from "../src/lib/columns";
 import { displayValue } from "../src/lib/formula";
-import { MCP_RESOURCE, getAuth } from "./auth";
+import { BASE_URL, MCP_RESOURCE, getAuth } from "./auth";
 import {
   applyCellMutations,
   applyHistory,
@@ -446,21 +446,50 @@ async function handleMcp(request: Request, owner: string): Promise<Response> {
   return transport.handleRequest(request);
 }
 
-// requireMcpAuth verifies the bearer token against the JWT plugin's keys and
-// answers with the RFC 9728 challenge itself when it is missing or invalid.
-// Built on first use for the same reason getAuth() is (see auth.ts).
-let mcpEndpoint: ((request: Request) => Promise<Response>) | undefined;
+// --- MCP access token gate ---------------------------------------------------
+//
+// @better-auth/mcp's requireMcpAuth would do this, but it fetches the JWKS
+// from the auth server's URL with global fetch(), and a Worker cannot fetch
+// its own workers.dev hostname (same-zone Worker-to-Worker requests need a
+// service binding). The verification itself is the same library call; only
+// the key set comes straight from the JWT plugin's store instead of over HTTP.
+//
+// Bearer tokens only. DPoP-bound tokens (RFC 9449) would need the request
+// context checks in verifyAccessTokenRequest, which has the same JWKS problem.
 
-function getMcpEndpoint() {
-  mcpEndpoint ??= requireMcpAuth(
-    getAuth(),
-    (request, claims) =>
-      typeof claims.sub === "string"
-        ? handleMcp(request, claims.sub)
-        : json(403, { error: "access token carries no subject" }),
-    { resource: MCP_RESOURCE },
+/** Stable identity for verifyJwsAccessToken's JWKS cache. */
+const JWKS_CACHE_KEY = {};
+
+function mcpChallenge(error?: "invalid_token"): Response {
+  const params = [`resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource/mcp"`];
+  if (error) params.push(`error="${error}"`);
+  return Response.json(
+    { error: error ?? "unauthorized" },
+    { status: 401, headers: { "WWW-Authenticate": `Bearer ${params.join(", ")}` } },
   );
-  return mcpEndpoint;
+}
+
+async function mcpEndpoint(request: Request): Promise<Response> {
+  const authorization = request.headers.get("authorization");
+  if (!authorization) return mcpChallenge();
+  const token = /^Bearer\s+(\S+)$/i.exec(authorization)?.[1];
+  if (!token) return mcpChallenge("invalid_token");
+
+  const auth = getAuth();
+  const { baseURL: issuer } = await auth.$context;
+  let claims;
+  try {
+    claims = await verifyJwsAccessToken(token, {
+      jwksFetch: () => auth.api.getJwks(),
+      jwksCacheKey: JWKS_CACHE_KEY,
+      verifyOptions: { issuer, audience: MCP_RESOURCE },
+    });
+  } catch {
+    return mcpChallenge("invalid_token");
+  }
+  if (typeof claims.sub !== "string")
+    return json(403, { error: "access token carries no subject" });
+  return handleMcp(request, claims.sub);
 }
 
 // --- routes ------------------------------------------------------------------
@@ -588,7 +617,7 @@ export async function handleApi(request: Request): Promise<Response | null> {
   if (pathname.startsWith("/api/auth/") || isDiscoveryPath(pathname)) {
     return getAuth().handler(request);
   }
-  if (pathname === "/mcp") return getMcpEndpoint()(request);
+  if (pathname === "/mcp") return mcpEndpoint(request);
   if (!pathname.startsWith("/api/")) return null;
 
   // Everything below is the signed-in user's own data.

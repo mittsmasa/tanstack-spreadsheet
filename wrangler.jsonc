@@ -8,9 +8,7 @@
     {
       "binding": "DB",
       "database_name": "tanstack-spreadsheet",
-      // Replace with the id printed by `wrangler d1 create tanstack-spreadsheet`.
-      // Local dev (miniflare) works with any value.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "08a279eb-a6c1-4171-83e2-20319f590c88",
       "migrations_dir": "migrations",
     },
   ],
@@ -20,6 +18,6 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SyncHub"] }],
   "vars": {
     // Production origin. Local dev overrides this via .dev.vars.
-    "BETTER_AUTH_URL": "https://tanstack-spreadsheet.REPLACE_ME.workers.dev",
+    "BETTER_AUTH_URL": "https://tanstack-spreadsheet.mitts-3be.workers.dev",
   },
 }

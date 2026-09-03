@@ -35,6 +35,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # worker-configuration.d.ts (binding types) is gitignored and generated here.
+      - name: Generate Worker types
+        run: pnpm cf-typegen
+
       - name: Type check
         run: pnpm type-check
 

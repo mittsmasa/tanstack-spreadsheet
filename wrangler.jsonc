@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tanstack-spreadsheet",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tanstack-spreadsheet",
+      // Replace with the id printed by `wrangler d1 create tanstack-spreadsheet`.
+      // Local dev (miniflare) works with any value.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "SYNC_HUB", "class_name": "SyncHub" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SyncHub"] }],
+  "vars": {
+    // Production origin. Local dev overrides this via .dev.vars.
+    "BETTER_AUTH_URL": "https://tanstack-spreadsheet.REPLACE_ME.workers.dev",
+  },
+}

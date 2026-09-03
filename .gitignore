@@ -14,3 +14,7 @@ todos.json
 
 # server-side SQLite data (spreadsheet SSoT)
 data
+
+# Cloudflare local secrets and generated binding types
+.dev.vars
+worker-configuration.d.ts

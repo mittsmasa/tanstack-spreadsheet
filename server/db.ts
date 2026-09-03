@@ -1,6 +1,4 @@
-// Server-side source of truth for spreadsheet data, backed by SQLite (libsql).
-// Local default is a file DB; set LIBSQL_URL / LIBSQL_AUTH_TOKEN to point at
-// Turso instead.
+// Server-side source of truth for spreadsheet data, backed by Cloudflare D1.
 //
 // The data is three levels deep: a book owns sheets, a sheet owns cells. Only
 // `sheets` records which book it belongs to — sheet ids are UUIDs and globally
@@ -10,19 +8,15 @@
 // `owner` is a Better Auth user id. Browser requests read it from the session;
 // MCP requests read it from the access token's `sub` claim, which is the same
 // user id as long as no `pairwiseSecret` is configured on the OAuth provider
-// (see server/auth.ts — adding one would break this equivalence).
+// (see server/auth-options.ts — adding one would break this equivalence).
 //
-// All writes go through this module in a single node process, so an in-process
-// EventEmitter is enough to fan changes out to SSE subscribers. (If the DB is
-// ever shared with external writers — e.g. Turso — change detection would need
-// polling; see README.)
+// Every committed write is published to the owner's SyncHub Durable Object,
+// which fans it out to that owner's open WebSocket subscribers. The publish is
+// awaited so a client that sees the HTTP response has already been notified.
+//
+// The schema lives in migrations/*.sql (applied with `pnpm db:migrate`).
 
-import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import path from "node:path";
-
-import { createClient } from "@libsql/client";
+import { env } from "cloudflare:workers";
 
 export type CellRow = { id: string; raw: string };
 
@@ -42,139 +36,73 @@ export type SheetOpError = "invalid-name" | "duplicate-name" | "unknown-sheet" |
 
 export type SheetOpResult = { ok: true; sheet: Sheet } | { ok: false; error: SheetOpError };
 
-export type ServerEvents = {
-  /** committed cell changes for a sheet */
-  cells: [book: string, sheet: string, changes: Array<CellChange>];
-  /** committed column widths for a sheet */
-  meta: [book: string, sheet: string, widths: Record<string, number>];
-  /** a book's sheet list after a create / rename / delete */
-  sheets: [book: string, sheets: Array<Sheet>];
-  /** an owner's book list after a create / rename / delete */
-  books: [owner: string, books: Array<Book>];
-};
-
-export const dbEvents = new EventEmitter<ServerEvents>();
-
-const url = process.env.LIBSQL_URL ?? "file:./data/spreadsheet.db";
-if (url.startsWith("file:")) {
-  // libsql does not create missing directories for file URLs
-  mkdirSync(path.dirname(url.slice("file:".length)), { recursive: true });
-}
-
-// Exported so Better Auth can put its own tables in the same database over the
-// same connection (see server/auth.ts).
-export const client = createClient({
-  url,
-  authToken: process.env.LIBSQL_AUTH_TOKEN,
-});
-
-// --- schema ------------------------------------------------------------------
-
-/** Spreadsheet-owned tables. Better Auth's tables live in the same database
- * and are deliberately absent from this list — the legacy reset below drops
- * exactly these and must never touch sign-in state. */
-const OWNED_TABLES = ["history", "sheet_meta", "cells", "sheets"];
-
-const SCHEMA = [
-  `CREATE TABLE IF NOT EXISTS books (
-    id TEXT NOT NULL PRIMARY KEY,
-    owner TEXT NOT NULL,
-    name TEXT NOT NULL
-  )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS books_owner_name ON books (owner, name)`,
-  `CREATE TABLE IF NOT EXISTS sheets (
-    id TEXT NOT NULL PRIMARY KEY,
-    book TEXT NOT NULL,
-    name TEXT NOT NULL
-  )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS sheets_book_name ON sheets (book, name)`,
-  `CREATE TABLE IF NOT EXISTS cells (
-    sheet TEXT NOT NULL,
-    id TEXT NOT NULL,
-    raw TEXT NOT NULL,
-    PRIMARY KEY (sheet, id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS sheet_meta (
-    sheet TEXT NOT NULL PRIMARY KEY,
-    widths TEXT NOT NULL DEFAULT '{}'
-  )`,
-  `CREATE TABLE IF NOT EXISTS history (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    sheet TEXT NOT NULL,
-    client TEXT NOT NULL,
-    ops TEXT NOT NULL,
-    undone INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
-  )`,
-];
-
 /**
- * Pre-book databases have a `sheets` table without a `book` column, and their
- * sheet names carry a global UNIQUE that has to become per-book. SQLite cannot
- * drop a column constraint, and the project decided not to migrate the data,
- * so the spreadsheet tables are rebuilt from scratch. Both halves run in one
- * transaction so a crash can never leave a half-dropped schema behind.
+ * A change notification, exactly as the browser receives it over the
+ * WebSocket. Book-scoped events carry the book so SyncHub can deliver them
+ * only to subscribers of that book; the book list is per owner and goes to
+ * every subscriber of that owner.
  */
-async function resetLegacySchema(): Promise<void> {
-  // PRAGMA on a missing table returns no rows rather than failing, so this
-  // doubles as the "is this a fresh database" check.
-  const columns = await client.execute("PRAGMA table_info(sheets)");
-  if (columns.rows.length === 0) return;
-  if (columns.rows.some((row) => String(row.name) === "book")) return;
+export type ServerEvent =
+  | { event: "cells"; book: string; data: { sheet: string; changes: Array<CellChange> } }
+  | { event: "meta"; book: string; data: { sheet: string; widths: Record<string, number> } }
+  | { event: "sheets"; book: string; data: { sheets: Array<Sheet> } }
+  | { event: "books"; data: { books: Array<Book> } };
 
-  console.warn(
-    `[db] pre-book schema detected — rebuilding ${OWNED_TABLES.join(", ")}. ` +
-      "Existing sheets and cells are discarded; sign-in state is untouched.",
-  );
-  await client.batch(
-    [...OWNED_TABLES.map((table) => `DROP TABLE IF EXISTS ${table}`), ...SCHEMA],
-    "write",
-  );
+async function publish(owner: string, event: ServerEvent): Promise<void> {
+  await env.SYNC_HUB.getByName(owner).publish(event);
 }
 
-const ready = (async () => {
-  await resetLegacySchema();
-  await client.batch(SCHEMA, "write");
-})();
+// --- D1 helpers --------------------------------------------------------------
+
+type Arg = string | number;
+
+function stmt(sql: string, args: ReadonlyArray<Arg> = []): D1PreparedStatement {
+  return env.DB.prepare(sql).bind(...args);
+}
+
+async function rows<T = Record<string, unknown>>(sql: string, args: ReadonlyArray<Arg> = []) {
+  return (await stmt(sql, args).all<T>()).results;
+}
+
+/** Run one write and return the number of affected rows. */
+async function run(sql: string, args: ReadonlyArray<Arg> = []): Promise<number> {
+  return (await stmt(sql, args).run()).meta.changes;
+}
+
+/** D1 runs a batch as a single transaction: all statements or none. */
+async function batch(statements: ReadonlyArray<{ sql: string; args: ReadonlyArray<Arg> }>) {
+  await env.DB.batch(statements.map(({ sql, args }) => stmt(sql, args)));
+}
 
 // --- books -------------------------------------------------------------------
 
 export async function getBooks(owner: string): Promise<Array<Book>> {
-  await ready;
-  const result = await client.execute({
-    sql: "SELECT id, name FROM books WHERE owner = ? ORDER BY rowid",
-    args: [owner],
-  });
-  return result.rows.map((row) => ({ id: String(row.id), name: String(row.name) }));
+  const result = await rows("SELECT id, name FROM books WHERE owner = ? ORDER BY rowid", [owner]);
+  return result.map((row) => ({ id: String(row.id), name: String(row.name) }));
 }
 
 /** The book's owner, or null when no such book exists. Callers compare this
  * against the requesting user and answer 404 on a mismatch. */
 export async function bookOwner(id: string): Promise<string | null> {
-  await ready;
-  const result = await client.execute({
-    sql: "SELECT owner FROM books WHERE id = ?",
-    args: [id],
-  });
-  const row = result.rows[0];
+  const row = (await rows("SELECT owner FROM books WHERE id = ?", [id]))[0];
   return row === undefined ? null : String(row.owner);
 }
 
 /** The book and owner a sheet belongs to, or null when no such sheet exists. */
 export async function sheetAccess(sheet: string): Promise<{ book: string; owner: string } | null> {
-  await ready;
-  const result = await client.execute({
-    sql: `SELECT sheets.book AS book, books.owner AS owner
-          FROM sheets JOIN books ON books.id = sheets.book
-          WHERE sheets.id = ?`,
-    args: [sheet],
-  });
-  const row = result.rows[0];
+  const row = (
+    await rows(
+      `SELECT sheets.book AS book, books.owner AS owner
+       FROM sheets JOIN books ON books.id = sheets.book
+       WHERE sheets.id = ?`,
+      [sheet],
+    )
+  )[0];
   return row === undefined ? null : { book: String(row.book), owner: String(row.owner) };
 }
 
-async function emitBooks(owner: string) {
-  dbEvents.emit("books", owner, await getBooks(owner));
+async function publishBooks(owner: string) {
+  await publish(owner, { event: "books", data: { books: await getBooks(owner) } });
 }
 
 /** Pick the first free "{prefix}{N}" among names already taken. */
@@ -191,7 +119,6 @@ function autoName(prefix: string, taken: ReadonlySet<string>, start: number): st
  * callers get a proper error instead of a raw constraint failure.
  */
 export async function createBook(owner: string, name?: string): Promise<BookOpResult> {
-  await ready;
   const books = await getBooks(owner);
   const names = new Set(books.map((b) => b.name));
   let resolved: string;
@@ -202,26 +129,22 @@ export async function createBook(owner: string, name?: string): Promise<BookOpRe
     if (resolved === "") return { ok: false, error: "invalid-name" };
     if (names.has(resolved)) return { ok: false, error: "duplicate-name" };
   }
-  const book: Book = { id: randomUUID(), name: resolved };
-  await client.batch(
-    [
-      {
-        sql: "INSERT INTO books (id, owner, name) VALUES (?, ?, ?)",
-        args: [book.id, owner, book.name],
-      },
-      {
-        sql: "INSERT INTO sheets (id, book, name) VALUES (?, ?, ?)",
-        args: [randomUUID(), book.id, "シート1"],
-      },
-    ],
-    "write",
-  );
-  await emitBooks(owner);
+  const book: Book = { id: crypto.randomUUID(), name: resolved };
+  await batch([
+    {
+      sql: "INSERT INTO books (id, owner, name) VALUES (?, ?, ?)",
+      args: [book.id, owner, book.name],
+    },
+    {
+      sql: "INSERT INTO sheets (id, book, name) VALUES (?, ?, ?)",
+      args: [crypto.randomUUID(), book.id, "シート1"],
+    },
+  ]);
+  await publishBooks(owner);
   return { ok: true, book };
 }
 
 export async function renameBook(owner: string, id: string, name: string): Promise<BookOpResult> {
-  await ready;
   const resolved = name.trim();
   if (resolved === "") return { ok: false, error: "invalid-name" };
   const books = await getBooks(owner);
@@ -230,11 +153,8 @@ export async function renameBook(owner: string, id: string, name: string): Promi
   if (books.some((b) => b.id !== id && b.name === resolved)) {
     return { ok: false, error: "duplicate-name" };
   }
-  await client.execute({
-    sql: "UPDATE books SET name = ? WHERE id = ?",
-    args: [resolved, id],
-  });
-  await emitBooks(owner);
+  await run("UPDATE books SET name = ? WHERE id = ?", [resolved, id]);
+  await publishBooks(owner);
   return { ok: true, book: { id, name: resolved } };
 }
 
@@ -245,42 +165,38 @@ export async function renameBook(owner: string, id: string, name: string): Promi
  * rows are removed before the sheets they are selected through.
  */
 export async function deleteBook(owner: string, id: string): Promise<BookOpResult> {
-  await ready;
   const books = await getBooks(owner);
   const target = books.find((b) => b.id === id);
   if (!target) return { ok: false, error: "unknown-book" };
-  const result = await client.execute({
-    sql: "DELETE FROM books WHERE id = ? AND (SELECT COUNT(*) FROM books WHERE owner = ?) > 1",
-    args: [id, owner],
-  });
-  if (result.rowsAffected === 0) return { ok: false, error: "last-book" };
-  const ofBook = "SELECT id FROM sheets WHERE book = ?";
-  await client.batch(
-    [
-      { sql: `DELETE FROM cells WHERE sheet IN (${ofBook})`, args: [id] },
-      { sql: `DELETE FROM sheet_meta WHERE sheet IN (${ofBook})`, args: [id] },
-      { sql: `DELETE FROM history WHERE sheet IN (${ofBook})`, args: [id] },
-      { sql: "DELETE FROM sheets WHERE book = ?", args: [id] },
-    ],
-    "write",
+  const changes = await run(
+    "DELETE FROM books WHERE id = ? AND (SELECT COUNT(*) FROM books WHERE owner = ?) > 1",
+    [id, owner],
   );
-  await emitBooks(owner);
+  if (changes === 0) return { ok: false, error: "last-book" };
+  const ofBook = "SELECT id FROM sheets WHERE book = ?";
+  await batch([
+    { sql: `DELETE FROM cells WHERE sheet IN (${ofBook})`, args: [id] },
+    { sql: `DELETE FROM sheet_meta WHERE sheet IN (${ofBook})`, args: [id] },
+    { sql: `DELETE FROM history WHERE sheet IN (${ofBook})`, args: [id] },
+    { sql: "DELETE FROM sheets WHERE book = ?", args: [id] },
+  ]);
+  await publishBooks(owner);
   return { ok: true, book: target };
 }
 
 // --- sheets ------------------------------------------------------------------
 
 export async function getSheets(book: string): Promise<Array<Sheet>> {
-  await ready;
-  const result = await client.execute({
-    sql: "SELECT id, name FROM sheets WHERE book = ? ORDER BY rowid",
-    args: [book],
-  });
-  return result.rows.map((row) => ({ id: String(row.id), name: String(row.name) }));
+  const result = await rows("SELECT id, name FROM sheets WHERE book = ? ORDER BY rowid", [book]);
+  return result.map((row) => ({ id: String(row.id), name: String(row.name) }));
 }
 
-async function emitSheets(book: string) {
-  dbEvents.emit("sheets", book, await getSheets(book));
+/** The sheet list is book-scoped, but SyncHub instances are per owner, so the
+ * owner is looked up here. A book that vanished meanwhile has nobody to tell. */
+async function publishSheets(book: string) {
+  const owner = await bookOwner(book);
+  if (owner === null) return;
+  await publish(owner, { event: "sheets", book, data: { sheets: await getSheets(book) } });
 }
 
 /**
@@ -288,7 +204,6 @@ async function emitSheets(book: string) {
  * within that book. Names are unique per book.
  */
 export async function createSheet(book: string, name?: string): Promise<SheetOpResult> {
-  await ready;
   const sheets = await getSheets(book);
   const names = new Set(sheets.map((s) => s.name));
   let resolved: string;
@@ -299,17 +214,13 @@ export async function createSheet(book: string, name?: string): Promise<SheetOpR
     if (resolved === "") return { ok: false, error: "invalid-name" };
     if (names.has(resolved)) return { ok: false, error: "duplicate-name" };
   }
-  const sheet: Sheet = { id: randomUUID(), name: resolved };
-  await client.execute({
-    sql: "INSERT INTO sheets (id, book, name) VALUES (?, ?, ?)",
-    args: [sheet.id, book, sheet.name],
-  });
-  await emitSheets(book);
+  const sheet: Sheet = { id: crypto.randomUUID(), name: resolved };
+  await run("INSERT INTO sheets (id, book, name) VALUES (?, ?, ?)", [sheet.id, book, sheet.name]);
+  await publishSheets(book);
   return { ok: true, sheet };
 }
 
 export async function renameSheet(book: string, id: string, name: string): Promise<SheetOpResult> {
-  await ready;
   const resolved = name.trim();
   if (resolved === "") return { ok: false, error: "invalid-name" };
   const sheets = await getSheets(book);
@@ -318,11 +229,8 @@ export async function renameSheet(book: string, id: string, name: string): Promi
   if (sheets.some((s) => s.id !== id && s.name === resolved)) {
     return { ok: false, error: "duplicate-name" };
   }
-  await client.execute({
-    sql: "UPDATE sheets SET name = ? WHERE id = ?",
-    args: [resolved, id],
-  });
-  await emitSheets(book);
+  await run("UPDATE sheets SET name = ? WHERE id = ?", [resolved, id]);
+  await publishSheets(book);
   return { ok: true, sheet: { id, name: resolved } };
 }
 
@@ -332,36 +240,28 @@ export async function renameSheet(book: string, id: string, name: string): Promi
  * race the count check and empty the book.
  */
 export async function deleteSheet(book: string, id: string): Promise<SheetOpResult> {
-  await ready;
   const sheets = await getSheets(book);
   const target = sheets.find((s) => s.id === id);
   if (!target) return { ok: false, error: "unknown-sheet" };
-  const result = await client.execute({
-    sql: "DELETE FROM sheets WHERE id = ? AND (SELECT COUNT(*) FROM sheets WHERE book = ?) > 1",
-    args: [id, book],
-  });
-  if (result.rowsAffected === 0) return { ok: false, error: "last-sheet" };
-  await client.batch(
-    [
-      { sql: "DELETE FROM cells WHERE sheet = ?", args: [id] },
-      { sql: "DELETE FROM sheet_meta WHERE sheet = ?", args: [id] },
-      { sql: "DELETE FROM history WHERE sheet = ?", args: [id] },
-    ],
-    "write",
+  const changes = await run(
+    "DELETE FROM sheets WHERE id = ? AND (SELECT COUNT(*) FROM sheets WHERE book = ?) > 1",
+    [id, book],
   );
-  await emitSheets(book);
+  if (changes === 0) return { ok: false, error: "last-sheet" };
+  await batch([
+    { sql: "DELETE FROM cells WHERE sheet = ?", args: [id] },
+    { sql: "DELETE FROM sheet_meta WHERE sheet = ?", args: [id] },
+    { sql: "DELETE FROM history WHERE sheet = ?", args: [id] },
+  ]);
+  await publishSheets(book);
   return { ok: true, sheet: target };
 }
 
 // --- cells -------------------------------------------------------------------
 
 export async function getCells(sheet: string): Promise<Array<CellRow>> {
-  await ready;
-  const result = await client.execute({
-    sql: "SELECT id, raw FROM cells WHERE sheet = ?",
-    args: [sheet],
-  });
-  return result.rows.map((row) => ({ id: String(row.id), raw: String(row.raw) }));
+  const result = await rows("SELECT id, raw FROM cells WHERE sheet = ?", [sheet]);
+  return result.map((row) => ({ id: String(row.id), raw: String(row.raw) }));
 }
 
 /**
@@ -369,7 +269,7 @@ export async function getCells(sheet: string): Promise<Array<CellRow>> {
  * cell — the same semantics as setCell in the UI. The change type is derived
  * from the current DB state so subscribers never see a delete+insert of the
  * same key (the react-db live-query congruence pitfall). No-op writes are
- * dropped from the emitted batch.
+ * dropped from the published batch.
  *
  * With `recordFor`, the applied batch is also written to the history table as
  * one undoable entry owned by that client (undo/redo application itself passes
@@ -380,15 +280,10 @@ export async function applyCellMutations(
   sheet: string,
   recordFor?: string,
 ): Promise<Array<CellChange>> {
-  await ready;
   const access = await sheetAccess(sheet);
   if (!access) throw new Error(`unknown sheet: ${sheet}`);
   const existing = new Map<string, string>();
-  const current = await client.execute({
-    sql: "SELECT id, raw FROM cells WHERE sheet = ?",
-    args: [sheet],
-  });
-  for (const row of current.rows) existing.set(String(row.id), String(row.raw));
+  for (const row of await getCells(sheet)) existing.set(row.id, row.raw);
 
   const statements: Array<{ sql: string; args: Array<string> }> = [];
   const changes: Array<CellChange> = [];
@@ -422,9 +317,9 @@ export async function applyCellMutations(
   }
 
   if (statements.length > 0) {
-    await client.batch(statements, "write");
+    await batch(statements);
     if (recordFor !== undefined) await recordHistoryEntry(sheet, recordFor, ops);
-    dbEvents.emit("cells", access.book, sheet, changes);
+    await publish(access.owner, { event: "cells", book: access.book, data: { sheet, changes } });
   }
   return changes;
 }
@@ -442,39 +337,36 @@ type HistoryOp = { id: string; before: string; after: string };
 
 const MAX_HISTORY_PER_SHEET = 200;
 
-async function recordHistoryEntry(sheet: string, client_: string, ops: Array<HistoryOp>) {
-  await client.batch(
-    [
-      {
-        sql: "DELETE FROM history WHERE sheet = ? AND client = ? AND undone = 1",
-        args: [sheet, client_],
-      },
-      {
-        sql: "INSERT INTO history (sheet, client, ops, undone, created_at) VALUES (?, ?, ?, 0, ?)",
-        args: [sheet, client_, JSON.stringify(ops), new Date().toISOString()],
-      },
-      {
-        sql: `DELETE FROM history WHERE sheet = ? AND seq NOT IN (
-                SELECT seq FROM history WHERE sheet = ? ORDER BY seq DESC LIMIT ${MAX_HISTORY_PER_SHEET}
-              )`,
-        args: [sheet, sheet],
-      },
-    ],
-    "write",
-  );
+async function recordHistoryEntry(sheet: string, client: string, ops: Array<HistoryOp>) {
+  await batch([
+    {
+      sql: "DELETE FROM history WHERE sheet = ? AND client = ? AND undone = 1",
+      args: [sheet, client],
+    },
+    {
+      sql: "INSERT INTO history (sheet, client, ops, undone, created_at) VALUES (?, ?, ?, 0, ?)",
+      args: [sheet, client, JSON.stringify(ops), new Date().toISOString()],
+    },
+    {
+      sql: `DELETE FROM history WHERE sheet = ? AND seq NOT IN (
+              SELECT seq FROM history WHERE sheet = ? ORDER BY seq DESC LIMIT ${MAX_HISTORY_PER_SHEET}
+            )`,
+      args: [sheet, sheet],
+    },
+  ]);
 }
 
 export type HistoryState = { canUndo: boolean; canRedo: boolean };
 
-export async function historyState(sheet: string, client_: string): Promise<HistoryState> {
-  await ready;
-  const result = await client.execute({
-    sql: `SELECT
-            EXISTS(SELECT 1 FROM history WHERE sheet = ? AND client = ? AND undone = 0) AS canUndo,
-            EXISTS(SELECT 1 FROM history WHERE sheet = ? AND client = ? AND undone = 1) AS canRedo`,
-    args: [sheet, client_, sheet, client_],
-  });
-  const row = result.rows[0];
+export async function historyState(sheet: string, client: string): Promise<HistoryState> {
+  const row = (
+    await rows(
+      `SELECT
+         EXISTS(SELECT 1 FROM history WHERE sheet = ? AND client = ? AND undone = 0) AS canUndo,
+         EXISTS(SELECT 1 FROM history WHERE sheet = ? AND client = ? AND undone = 1) AS canRedo`,
+      [sheet, client, sheet, client],
+    )
+  )[0];
   return { canUndo: Number(row?.canUndo) === 1, canRedo: Number(row?.canRedo) === 1 };
 }
 
@@ -487,30 +379,21 @@ export async function historyState(sheet: string, client_: string): Promise<Hist
  */
 export async function applyHistory(
   sheet: string,
-  client_: string,
+  client: string,
   direction: "undo" | "redo",
 ): Promise<{ applied: number } & HistoryState> {
-  await ready;
-  const entry = await client.execute(
-    direction === "undo"
-      ? {
-          sql: "SELECT seq, ops FROM history WHERE sheet = ? AND client = ? AND undone = 0 ORDER BY seq DESC LIMIT 1",
-          args: [sheet, client_],
-        }
-      : {
-          sql: "SELECT seq, ops FROM history WHERE sheet = ? AND client = ? AND undone = 1 ORDER BY seq ASC LIMIT 1",
-          args: [sheet, client_],
-        },
-  );
-  const row = entry.rows[0];
-  if (!row) return { applied: 0, ...(await historyState(sheet, client_)) };
+  const row = (
+    await rows(
+      direction === "undo"
+        ? "SELECT seq, ops FROM history WHERE sheet = ? AND client = ? AND undone = 0 ORDER BY seq DESC LIMIT 1"
+        : "SELECT seq, ops FROM history WHERE sheet = ? AND client = ? AND undone = 1 ORDER BY seq ASC LIMIT 1",
+      [sheet, client],
+    )
+  )[0];
+  if (!row) return { applied: 0, ...(await historyState(sheet, client)) };
   const ops = JSON.parse(String(row.ops)) as Array<HistoryOp>;
 
-  const current = await client.execute({
-    sql: "SELECT id, raw FROM cells WHERE sheet = ?",
-    args: [sheet],
-  });
-  const currentRaw = new Map(current.rows.map((r) => [String(r.id), String(r.raw)]));
+  const currentRaw = new Map((await getCells(sheet)).map((r) => [r.id, r.raw]));
 
   const writes: Array<CellRow> = [];
   for (const op of ops) {
@@ -519,22 +402,17 @@ export async function applyHistory(
     if ((currentRaw.get(op.id) ?? "") === expected) writes.push({ id: op.id, raw: target });
   }
   const changes = await applyCellMutations(writes, sheet);
-  await client.execute({
-    sql: "UPDATE history SET undone = ? WHERE seq = ?",
-    args: [direction === "undo" ? 1 : 0, Number(row.seq)],
-  });
-  return { applied: changes.length, ...(await historyState(sheet, client_)) };
+  await run("UPDATE history SET undone = ? WHERE seq = ?", [
+    direction === "undo" ? 1 : 0,
+    Number(row.seq),
+  ]);
+  return { applied: changes.length, ...(await historyState(sheet, client)) };
 }
 
 // --- column widths -----------------------------------------------------------
 
 export async function getWidths(sheet: string): Promise<Record<string, number>> {
-  await ready;
-  const result = await client.execute({
-    sql: "SELECT widths FROM sheet_meta WHERE sheet = ?",
-    args: [sheet],
-  });
-  const raw = result.rows[0]?.widths;
+  const raw = (await rows("SELECT widths FROM sheet_meta WHERE sheet = ?", [sheet]))[0]?.widths;
   if (typeof raw !== "string") return {};
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -545,17 +423,17 @@ export async function getWidths(sheet: string): Promise<Record<string, number>> 
 }
 
 /** Persist column widths. Identical writes are dropped, which also breaks the
- * client echo loop (atom subscribe → persist → SSE → atom set → persist…). */
+ * client echo loop (atom subscribe → persist → WebSocket → atom set → persist…). */
 export async function setWidths(widths: Record<string, number>, sheet: string): Promise<void> {
   const access = await sheetAccess(sheet);
   if (!access) throw new Error(`unknown sheet: ${sheet}`);
   const current = await getWidths(sheet);
   const next = JSON.stringify(widths);
   if (JSON.stringify(current) === next) return;
-  await client.execute({
-    sql: `INSERT INTO sheet_meta (sheet, widths) VALUES (?, ?)
-          ON CONFLICT(sheet) DO UPDATE SET widths = excluded.widths`,
-    args: [sheet, next],
-  });
-  dbEvents.emit("meta", access.book, sheet, widths);
+  await run(
+    `INSERT INTO sheet_meta (sheet, widths) VALUES (?, ?)
+     ON CONFLICT(sheet) DO UPDATE SET widths = excluded.widths`,
+    [sheet, next],
+  );
+  await publish(access.owner, { event: "meta", book: access.book, data: { sheet, widths } });
 }

@@ -1,4 +1,4 @@
-// Vite plugin hosting the whole server side of the spreadsheet:
+// The whole HTTP API of the spreadsheet, answered before the Start handler:
 //   ALL    /api/auth/*                Better Auth (Google sign-in + OAuth server)
 //   GET    /.well-known/oauth-*       OAuth discovery, served by the auth handler
 //   GET    /api/books                 the signed-in user's books
@@ -11,9 +11,11 @@
 //   DELETE /api/sheets/:id            delete a sheet and its data
 //   GET    /api/cells?sheet=          cell snapshot for one sheet
 //   POST   /api/cells/mutations       batch cell writes (raw "" = delete), body carries `sheet`
+//   POST   /api/history/undo|redo     apply the client's nearest history entry
+//   GET    /api/history/state         canUndo / canRedo for a client on a sheet
 //   GET    /api/meta?sheet=           column widths for one sheet
 //   POST   /api/meta                  persist column widths, body carries `sheet`
-//   GET    /api/stream?book=          SSE: one book's snapshot, then change batches
+//   GET    /api/stream?book=          WebSocket: one book's snapshot, then change batches
 //   ALL    /mcp                       MCP endpoint (streamable HTTP, stateless)
 //
 // Everything except /api/auth and the discovery documents requires a signed-in
@@ -22,26 +24,24 @@
 // only ever reaches data owned by that user — a book or sheet belonging to
 // somebody else answers 404 rather than 403, so its existence stays private.
 //
-// Everything lives in one plugin on purpose: the Start server routes run in a
-// separate module graph, so splitting the pieces would duplicate the db module
-// and silently disconnect the change feed from the SSE subscribers.
+// handleApi returns null for anything it does not own so the Worker entry can
+// fall through to the Start handler.
 
 import { requireMcpAuth } from "@better-auth/mcp";
+import { env } from "cloudflare:workers";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 
 import { cellId, parseCellId } from "../src/lib/columns";
 import { displayValue } from "../src/lib/formula";
-import { BASE_URL, MCP_RESOURCE, auth } from "./auth";
+import { MCP_RESOURCE, getAuth } from "./auth";
 import {
   applyCellMutations,
   applyHistory,
   bookOwner,
   createBook,
   createSheet,
-  dbEvents,
   deleteBook,
   deleteSheet,
   getBooks,
@@ -55,34 +55,25 @@ import {
   sheetAccess,
 } from "./db";
 
-import type { Book, BookOpError, CellRow, Sheet, SheetOpError } from "./db";
-import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Plugin } from "vite";
+import type { BookOpError, CellRow, SheetOpError } from "./db";
 
 const MAX_RANGE_CELLS = 10_000;
 
 // --- helpers -----------------------------------------------------------------
 
-function readBody(req: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const chunks: Array<Buffer> = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
-      const text = Buffer.concat(chunks).toString("utf8");
-      if (text === "") return resolve(undefined);
-      try {
-        resolve(JSON.parse(text));
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-    req.on("error", reject);
-  });
+function json(status: number, body: unknown): Response {
+  return Response.json(body, { status });
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown) {
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(JSON.stringify(body));
+/** The JSON body, or null when absent or malformed. */
+async function readBody(request: Request): Promise<unknown> {
+  const text = await request.text();
+  if (text === "") return null;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
 }
 
 /** A required string field of a POST body, or null when absent / not a string. */
@@ -92,8 +83,6 @@ function stringField(body: unknown, field: string): string | null {
 }
 
 // --- auth ---------------------------------------------------------------------
-
-const authHandler = toNodeHandler(auth);
 
 /** Discovery documents MCP clients fetch from the origin root. Better Auth's
  * router runs its plugin onRequest hooks before base-path routing, so handing
@@ -106,61 +95,10 @@ function isDiscoveryPath(pathname: string): boolean {
   );
 }
 
-async function writeWebResponse(res: ServerResponse, response: Response) {
-  const headers: Record<string, string> = {};
-  response.headers.forEach((value, key) => {
-    headers[key] = value;
-  });
-  res.writeHead(response.status, headers);
-  res.end(Buffer.from(await response.arrayBuffer()));
-}
-
-/** The signed-in user's id, or null after replying 401. */
-async function requireSession(req: IncomingMessage, res: ServerResponse): Promise<string | null> {
-  const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
-  if (session) return session.user.id;
-  sendJson(res, 401, { error: "unauthorized" });
-  return null;
-}
-
-// requireMcpAuth speaks Web Request/Response while the MCP transport needs the
-// raw Node req/res, so it runs as a gate only: this sentinel status means the
-// bearer token checked out and the real handler should take over, and anything
-// else is the RFC 9728 challenge to send back verbatim. The verified subject
-// rides back on a header rather than a closure variable, so concurrent
-// requests cannot read each other's identity.
-const MCP_TOKEN_OK = 204;
-const MCP_SUB_HEADER = "x-mcp-subject";
-
-const mcpGate = requireMcpAuth(
-  auth,
-  (_request, claims) =>
-    new Response(null, {
-      status: MCP_TOKEN_OK,
-      headers: { [MCP_SUB_HEADER]: typeof claims.sub === "string" ? claims.sub : "" },
-    }),
-  { resource: MCP_RESOURCE },
-);
-
-/** The token subject (a Better Auth user id), or null after replying with an
- * OAuth challenge. */
-async function requireMcpToken(req: IncomingMessage, res: ServerResponse): Promise<string | null> {
-  // Token verification reads only the method, URL and headers, so the body is
-  // left on the stream for the MCP transport to consume.
-  const verdict = await mcpGate(
-    new Request(new URL(req.url ?? "/", BASE_URL), {
-      method: req.method ?? "GET",
-      headers: fromNodeHeaders(req.headers),
-    }),
-  );
-  if (verdict.status !== MCP_TOKEN_OK) {
-    await writeWebResponse(res, verdict);
-    return null;
-  }
-  const subject = verdict.headers.get(MCP_SUB_HEADER);
-  if (subject) return subject;
-  sendJson(res, 403, { error: "access token carries no subject" });
-  return null;
+/** The signed-in user's id, or null when there is no valid session. */
+async function sessionOwner(request: Request): Promise<string | null> {
+  const session = await getAuth().api.getSession({ headers: request.headers });
+  return session ? session.user.id : null;
 }
 
 // --- request parsing ----------------------------------------------------------
@@ -486,368 +424,246 @@ async function callTool(
   }
 }
 
-async function handleMcp(req: IncomingMessage, res: ServerResponse, owner: string) {
-  const body = await readBody(req).catch(() => undefined);
+/** One stateless MCP exchange: a fresh server + transport per request. */
+async function handleMcp(request: Request, owner: string): Promise<Response> {
   const server = new Server(
     { name: "tanstack-spreadsheet", version: "0.1.0" },
     { capabilities: { tools: {} } },
   );
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: TOOLS }));
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (mcpRequest) => {
     try {
-      return await callTool(owner, request.params.name, request.params.arguments ?? {});
+      return await callTool(owner, mcpRequest.params.name, mcpRequest.params.arguments ?? {});
     } catch (error) {
       return toolError(error instanceof Error ? error.message : String(error));
     }
   });
-  const transport = new StreamableHTTPServerTransport({
+  const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
   });
-  res.on("close", () => {
-    void transport.close();
-    void server.close();
-  });
   await server.connect(transport);
-  await transport.handleRequest(req, res, body);
+  return transport.handleRequest(request);
 }
 
-// --- SSE ---------------------------------------------------------------------
+// requireMcpAuth verifies the bearer token against the JWT plugin's keys and
+// answers with the RFC 9728 challenge itself when it is missing or invalid.
+// Built on first use for the same reason getAuth() is (see auth.ts).
+let mcpEndpoint: ((request: Request) => Promise<Response>) | undefined;
 
-function sendEvent(res: ServerResponse, event: string, data: unknown) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+function getMcpEndpoint() {
+  mcpEndpoint ??= requireMcpAuth(
+    getAuth(),
+    (request, claims) =>
+      typeof claims.sub === "string"
+        ? handleMcp(request, claims.sub)
+        : json(403, { error: "access token carries no subject" }),
+    { resource: MCP_RESOURCE },
+  );
+  return mcpEndpoint;
 }
 
-/**
- * One book's live feed. The stream is scoped to a single book so the opening
- * snapshot stays the size of what the tab actually shows; switching books
- * means reconnecting with a different `book`.
- *
- * The two event families match on different keys: cell / width / sheet-list
- * events carry the book they happened in, while the book-list event carries an
- * owner and no book at all. Matching it on `book` would silently never deliver.
- */
-async function handleStream(
-  res: ServerResponse,
-  req: IncomingMessage,
-  owner: string,
-  book: string,
-) {
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-  });
-  // Whole-book snapshot: the EventSource auto-reconnect relies on this resend
-  // to resync every per-sheet collection over the single shared stream.
-  const sheets = await getSheets(book);
-  const bySheet: Record<string, { cells: Array<CellRow>; widths: Record<string, number> }> = {};
-  for (const sheet of sheets) {
-    const [cells, widths] = await Promise.all([getCells(sheet.id), getWidths(sheet.id)]);
-    bySheet[sheet.id] = { cells, widths };
-  }
-  sendEvent(res, "snapshot", { book, books: await getBooks(owner), sheets, bySheet });
+// --- routes ------------------------------------------------------------------
 
-  const onCells = (eventBook: string, sheet: string, changes: unknown) => {
-    if (eventBook === book) sendEvent(res, "cells", { sheet, changes });
-  };
-  const onMeta = (eventBook: string, sheet: string, widths: unknown) => {
-    if (eventBook === book) sendEvent(res, "meta", { sheet, widths });
-  };
-  const onSheets = (eventBook: string, nextSheets: Array<Sheet>) => {
-    if (eventBook === book) sendEvent(res, "sheets", { sheets: nextSheets });
-  };
-  const onBooks = (eventOwner: string, nextBooks: Array<Book>) => {
-    if (eventOwner === owner) sendEvent(res, "books", { books: nextBooks });
-  };
-  dbEvents.on("cells", onCells);
-  dbEvents.on("meta", onMeta);
-  dbEvents.on("sheets", onSheets);
-  dbEvents.on("books", onBooks);
-  const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 30_000);
-  req.on("close", () => {
-    clearInterval(keepAlive);
-    dbEvents.off("cells", onCells);
-    dbEvents.off("meta", onMeta);
-    dbEvents.off("sheets", onSheets);
-    dbEvents.off("books", onBooks);
-  });
+/** 404 unless the book exists and belongs to this user; null means the caller
+ * may proceed. Someone else's book is indistinguishable from a missing one on
+ * purpose. */
+async function bookGuard(book: string, owner: string): Promise<Response | null> {
+  if ((await bookOwner(book)) === owner) return null;
+  return json(404, { error: `unknown book: ${book}` });
 }
 
-// --- plugin ------------------------------------------------------------------
-
-/** Reply 404 unless the book exists and belongs to this user; true means the
- * caller may proceed. Someone else's book is indistinguishable from a missing
- * one on purpose. */
-async function requireBook(res: ServerResponse, book: string, owner: string): Promise<boolean> {
-  if ((await bookOwner(book)) === owner) return true;
-  sendJson(res, 404, { error: `unknown book: ${book}` });
-  return false;
-}
-
-/** The book a sheet belongs to, or null after replying 404 (missing sheet, or
- * one under somebody else's book). */
-async function requireSheet(
-  res: ServerResponse,
-  sheet: string,
-  owner: string,
-): Promise<string | null> {
+/** The book a sheet belongs to, or a 404 response (missing sheet, or one under
+ * somebody else's book). */
+async function sheetGuard(sheet: string, owner: string): Promise<{ book: string } | Response> {
   const access = await sheetAccess(sheet);
-  if (access && access.owner === owner) return access.book;
-  sendJson(res, 404, { error: `unknown sheet: ${sheet}` });
-  return null;
+  if (access && access.owner === owner) return { book: access.book };
+  return json(404, { error: `unknown sheet: ${sheet}` });
 }
 
-/** The required `sheet` field of a request, or null after replying 400. */
-function requireSheetParam(res: ServerResponse, sheet: string | null): sheet is string {
-  if (sheet !== null) return true;
-  sendJson(res, 400, { error: "missing sheet" });
-  return false;
+function bookOpResponse(result: Awaited<ReturnType<typeof createBook>>): Response {
+  return result.ok
+    ? json(200, { book: result.book })
+    : json(BOOK_OP_STATUS[result.error], { error: result.error });
 }
 
-function sendBookOpError(res: ServerResponse, error: BookOpError) {
-  sendJson(res, BOOK_OP_STATUS[error], { error });
-}
-
-function sendSheetOpError(res: ServerResponse, error: SheetOpError) {
-  sendJson(res, SHEET_OP_STATUS[error], { error });
+function sheetOpResponse(result: Awaited<ReturnType<typeof createSheet>>): Response {
+  return result.ok
+    ? json(200, { sheet: result.sheet })
+    : json(SHEET_OP_STATUS[result.error], { error: result.error });
 }
 
 async function handleBooks(
-  req: IncomingMessage,
-  res: ServerResponse,
+  request: Request,
   owner: string,
   pathname: string,
-  method: string,
-): Promise<boolean> {
+): Promise<Response | null> {
+  const method = request.method;
   if (pathname === "/api/books" && method === "GET") {
-    sendJson(res, 200, { books: await getBooks(owner) });
-    return true;
+    return json(200, { books: await getBooks(owner) });
   }
   if (pathname === "/api/books" && method === "POST") {
-    const body = (await readBody(req).catch(() => null)) as { name?: unknown } | null;
+    const body = (await readBody(request)) as { name?: unknown } | null;
     if (body?.name !== undefined && typeof body.name !== "string") {
-      sendJson(res, 400, { error: "invalid book name" });
-      return true;
+      return json(400, { error: "invalid book name" });
     }
-    const result = await createBook(owner, body?.name);
-    if (!result.ok) sendBookOpError(res, result.error);
-    else sendJson(res, 200, { book: result.book });
-    return true;
+    return bookOpResponse(await createBook(owner, body?.name));
   }
-  if (!pathname.startsWith("/api/books/")) return false;
+  if (!pathname.startsWith("/api/books/")) return null;
   const id = decodeURIComponent(pathname.slice("/api/books/".length));
   if (method === "PATCH") {
-    const body = (await readBody(req).catch(() => null)) as { name?: unknown } | null;
-    if (typeof body?.name !== "string") {
-      sendJson(res, 400, { error: "invalid book name" });
-      return true;
-    }
-    if (!(await requireBook(res, id, owner))) return true;
-    const result = await renameBook(owner, id, body.name);
-    if (!result.ok) sendBookOpError(res, result.error);
-    else sendJson(res, 200, { book: result.book });
-    return true;
+    const body = (await readBody(request)) as { name?: unknown } | null;
+    if (typeof body?.name !== "string") return json(400, { error: "invalid book name" });
+    return (await bookGuard(id, owner)) ?? bookOpResponse(await renameBook(owner, id, body.name));
   }
   if (method === "DELETE") {
-    if (!(await requireBook(res, id, owner))) return true;
+    const denied = await bookGuard(id, owner);
+    if (denied) return denied;
     const result = await deleteBook(owner, id);
-    if (!result.ok) sendBookOpError(res, result.error);
-    else sendJson(res, 200, { ok: true });
-    return true;
+    return result.ok ? json(200, { ok: true }) : bookOpResponse(result);
   }
-  return false;
+  return null;
 }
 
 async function handleSheets(
-  req: IncomingMessage,
-  res: ServerResponse,
+  request: Request,
   owner: string,
   pathname: string,
-  method: string,
   searchParams: URLSearchParams,
-): Promise<boolean> {
+): Promise<Response | null> {
+  const method = request.method;
   if (pathname === "/api/sheets" && method === "GET") {
     const book = searchParams.get("book");
-    if (book === null) {
-      sendJson(res, 400, { error: "missing book" });
-      return true;
-    }
-    if (!(await requireBook(res, book, owner))) return true;
-    sendJson(res, 200, { sheets: await getSheets(book) });
-    return true;
+    if (book === null) return json(400, { error: "missing book" });
+    return (await bookGuard(book, owner)) ?? json(200, { sheets: await getSheets(book) });
   }
   if (pathname === "/api/sheets" && method === "POST") {
-    const body = (await readBody(req).catch(() => null)) as {
-      book?: unknown;
-      name?: unknown;
-    } | null;
+    const body = (await readBody(request)) as { book?: unknown; name?: unknown } | null;
     const book = stringField(body, "book");
-    if (book === null) {
-      sendJson(res, 400, { error: "missing book" });
-      return true;
-    }
+    if (book === null) return json(400, { error: "missing book" });
     if (body?.name !== undefined && typeof body.name !== "string") {
-      sendJson(res, 400, { error: "invalid sheet name" });
-      return true;
+      return json(400, { error: "invalid sheet name" });
     }
-    if (!(await requireBook(res, book, owner))) return true;
-    const result = await createSheet(book, body?.name);
-    if (!result.ok) sendSheetOpError(res, result.error);
-    else sendJson(res, 200, { sheet: result.sheet });
-    return true;
+    return (await bookGuard(book, owner)) ?? sheetOpResponse(await createSheet(book, body?.name));
   }
-  if (!pathname.startsWith("/api/sheets/")) return false;
+  if (!pathname.startsWith("/api/sheets/")) return null;
   const id = decodeURIComponent(pathname.slice("/api/sheets/".length));
   if (method === "PATCH") {
-    const body = (await readBody(req).catch(() => null)) as { name?: unknown } | null;
-    if (typeof body?.name !== "string") {
-      sendJson(res, 400, { error: "invalid sheet name" });
-      return true;
-    }
-    const book = await requireSheet(res, id, owner);
-    if (book === null) return true;
-    const result = await renameSheet(book, id, body.name);
-    if (!result.ok) sendSheetOpError(res, result.error);
-    else sendJson(res, 200, { sheet: result.sheet });
-    return true;
+    const body = (await readBody(request)) as { name?: unknown } | null;
+    if (typeof body?.name !== "string") return json(400, { error: "invalid sheet name" });
+    const access = await sheetGuard(id, owner);
+    if (access instanceof Response) return access;
+    return sheetOpResponse(await renameSheet(access.book, id, body.name));
   }
   if (method === "DELETE") {
-    const book = await requireSheet(res, id, owner);
-    if (book === null) return true;
-    const result = await deleteSheet(book, id);
-    if (!result.ok) sendSheetOpError(res, result.error);
-    else sendJson(res, 200, { ok: true });
-    return true;
+    const access = await sheetGuard(id, owner);
+    if (access instanceof Response) return access;
+    const result = await deleteSheet(access.book, id);
+    return result.ok ? json(200, { ok: true }) : sheetOpResponse(result);
   }
-  return false;
+  return null;
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const { pathname, searchParams } = new URL(req.url ?? "", "http://localhost");
-  const method = req.method ?? "GET";
+/** Hand the upgrade to the owner's SyncHub, which accepts the socket and
+ * sends the book snapshot. Ownership was already checked by the caller. */
+function openStream(request: Request, owner: string, book: string): Promise<Response> {
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return Promise.resolve(json(426, { error: "expected websocket upgrade" }));
+  }
+  const target = new URL(request.url);
+  target.search = "";
+  target.searchParams.set("owner", owner);
+  target.searchParams.set("book", book);
+  return env.SYNC_HUB.getByName(owner).fetch(new Request(target, request));
+}
+
+/**
+ * Answer the request if it belongs to the API, otherwise return null so the
+ * Worker entry falls through to the Start handler.
+ */
+export async function handleApi(request: Request): Promise<Response | null> {
+  const { pathname, searchParams } = new URL(request.url);
+  const method = request.method;
 
   if (pathname.startsWith("/api/auth/") || isDiscoveryPath(pathname)) {
-    await authHandler(req, res);
-    return true;
+    return getAuth().handler(request);
   }
-  if (pathname === "/mcp") {
-    const owner = await requireMcpToken(req, res);
-    if (owner !== null) await handleMcp(req, res, owner);
-    return true;
-  }
-  if (!pathname.startsWith("/api/")) return false;
+  if (pathname === "/mcp") return getMcpEndpoint()(request);
+  if (!pathname.startsWith("/api/")) return null;
+
   // Everything below is the signed-in user's own data.
-  const owner = await requireSession(req, res);
-  if (owner === null) return true;
+  const owner = await sessionOwner(request);
+  if (owner === null) return json(401, { error: "unauthorized" });
 
   if (pathname === "/api/stream" && method === "GET") {
     const book = searchParams.get("book");
-    if (book === null) {
-      sendJson(res, 400, { error: "missing book" });
-      return true;
-    }
-    if (!(await requireBook(res, book, owner))) return true;
-    await handleStream(res, req, owner, book);
-    return true;
+    if (book === null) return json(400, { error: "missing book" });
+    return (await bookGuard(book, owner)) ?? openStream(request, owner, book);
   }
-  if (await handleBooks(req, res, owner, pathname, method)) return true;
-  if (await handleSheets(req, res, owner, pathname, method, searchParams)) return true;
+  const books = await handleBooks(request, owner, pathname);
+  if (books) return books;
+  const sheets = await handleSheets(request, owner, pathname, searchParams);
+  if (sheets) return sheets;
 
   if (pathname === "/api/cells" && method === "GET") {
     const sheet = searchParams.get("sheet");
-    if (!requireSheetParam(res, sheet)) return true;
-    if ((await requireSheet(res, sheet, owner)) === null) return true;
-    sendJson(res, 200, { cells: await getCells(sheet) });
-    return true;
+    if (sheet === null) return json(400, { error: "missing sheet" });
+    const access = await sheetGuard(sheet, owner);
+    if (access instanceof Response) return access;
+    return json(200, { cells: await getCells(sheet) });
   }
   if (pathname === "/api/cells/mutations" && method === "POST") {
-    const body = await readBody(req).catch(() => null);
+    const body = await readBody(request);
     const cells = body === null ? null : parseMutationPayload(body);
-    if (!cells) {
-      sendJson(res, 400, { error: "invalid mutation payload" });
-      return true;
-    }
+    if (!cells) return json(400, { error: "invalid mutation payload" });
     const sheet = stringField(body, "sheet");
-    if (!requireSheetParam(res, sheet)) return true;
-    if ((await requireSheet(res, sheet, owner)) === null) return true;
+    if (sheet === null) return json(400, { error: "missing sheet" });
+    const access = await sheetGuard(sheet, owner);
+    if (access instanceof Response) return access;
     const client = clientOf(body);
     const changes = await applyCellMutations(cells, sheet, client);
     const state = client === undefined ? {} : await historyState(sheet, client);
-    sendJson(res, 200, { applied: changes.length, ...state });
-    return true;
+    return json(200, { applied: changes.length, ...state });
   }
   if ((pathname === "/api/history/undo" || pathname === "/api/history/redo") && method === "POST") {
-    const body = await readBody(req).catch(() => null);
+    const body = await readBody(request);
     const client = clientOf(body);
-    if (client === undefined) {
-      sendJson(res, 400, { error: "missing client" });
-      return true;
-    }
+    if (client === undefined) return json(400, { error: "missing client" });
     const sheet = stringField(body, "sheet");
-    if (!requireSheetParam(res, sheet)) return true;
-    if ((await requireSheet(res, sheet, owner)) === null) return true;
+    if (sheet === null) return json(400, { error: "missing sheet" });
+    const access = await sheetGuard(sheet, owner);
+    if (access instanceof Response) return access;
     const direction = pathname === "/api/history/undo" ? "undo" : "redo";
-    sendJson(res, 200, await applyHistory(sheet, client, direction));
-    return true;
+    return json(200, await applyHistory(sheet, client, direction));
   }
   if (pathname === "/api/history/state" && method === "GET") {
     const client = searchParams.get("client");
-    if (client === null || client.trim() === "") {
-      sendJson(res, 400, { error: "missing client" });
-      return true;
-    }
+    if (client === null || client.trim() === "") return json(400, { error: "missing client" });
     const sheet = searchParams.get("sheet");
-    if (!requireSheetParam(res, sheet)) return true;
-    if ((await requireSheet(res, sheet, owner)) === null) return true;
-    sendJson(res, 200, await historyState(sheet, client));
-    return true;
+    if (sheet === null) return json(400, { error: "missing sheet" });
+    const access = await sheetGuard(sheet, owner);
+    if (access instanceof Response) return access;
+    return json(200, await historyState(sheet, client));
   }
   if (pathname === "/api/meta" && method === "GET") {
     const sheet = searchParams.get("sheet");
-    if (!requireSheetParam(res, sheet)) return true;
-    if ((await requireSheet(res, sheet, owner)) === null) return true;
-    sendJson(res, 200, { widths: await getWidths(sheet) });
-    return true;
+    if (sheet === null) return json(400, { error: "missing sheet" });
+    const access = await sheetGuard(sheet, owner);
+    if (access instanceof Response) return access;
+    return json(200, { widths: await getWidths(sheet) });
   }
   if (pathname === "/api/meta" && method === "POST") {
-    const body = (await readBody(req).catch(() => null)) as {
-      widths?: unknown;
-      sheet?: unknown;
-    } | null;
+    const body = (await readBody(request)) as { widths?: unknown; sheet?: unknown } | null;
     const widths = body?.widths;
     if (widths === null || typeof widths !== "object" || Array.isArray(widths)) {
-      sendJson(res, 400, { error: "invalid widths payload" });
-      return true;
+      return json(400, { error: "invalid widths payload" });
     }
     const sheet = stringField(body, "sheet");
-    if (!requireSheetParam(res, sheet)) return true;
-    if ((await requireSheet(res, sheet, owner)) === null) return true;
+    if (sheet === null) return json(400, { error: "missing sheet" });
+    const access = await sheetGuard(sheet, owner);
+    if (access instanceof Response) return access;
     await setWidths(widths as Record<string, number>, sheet);
-    sendJson(res, 200, { ok: true });
-    return true;
+    return json(200, { ok: true });
   }
-  return false;
-}
-
-export function spreadsheetServer(): Plugin {
-  const middleware = (req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
-    handle(req, res)
-      .then((handled) => {
-        if (!handled) next();
-      })
-      .catch((error: unknown) => {
-        if (!res.headersSent) sendJson(res, 500, { error: String(error) });
-        else res.end();
-      });
-  };
-  return {
-    name: "spreadsheet-server",
-    configureServer(server) {
-      server.middlewares.use(middleware);
-    },
-    configurePreviewServer(server) {
-      server.middlewares.use(middleware);
-    },
-  };
+  return null;
 }

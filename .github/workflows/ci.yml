@@ -45,3 +45,12 @@ jobs:
       - name: Lint
         if: ${{ !cancelled() }}
         run: pnpm lint
+
+      # storybook project の play テストは本物の chromium で動く
+      - name: Install Playwright browsers
+        if: ${{ !cancelled() }}
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Test
+        if: ${{ !cancelled() }}
+        run: pnpm test

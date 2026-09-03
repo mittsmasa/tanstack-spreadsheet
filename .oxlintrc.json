@@ -9,5 +9,5 @@
     "react/react-in-jsx-scope": "off",
     "react/incompatible-library": "off"
   },
-  "ignorePatterns": ["src/routeTree.gen.ts", "dist", ".tanstack", ".output"]
+  "ignorePatterns": ["src/routeTree.gen.ts", "dist", ".tanstack", ".output", "storybook-static"]
 }

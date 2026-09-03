@@ -18,3 +18,7 @@ data
 # Cloudflare local secrets and generated binding types
 .dev.vars
 worker-configuration.d.ts
+
+# storybook build output
+storybook-static
+*storybook.log

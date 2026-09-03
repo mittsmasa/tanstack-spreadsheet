@@ -48,8 +48,19 @@ export type ServerEvent =
   | { event: "sheets"; book: string; data: { sheets: Array<Sheet> } }
   | { event: "books"; data: { books: Array<Book> } };
 
-async function publish(owner: string, event: ServerEvent): Promise<void> {
-  await env.SYNC_HUB.getByName(owner).publish(event);
+/**
+ * Where committed writes are announced. Every publish in this module goes
+ * through `sync.publish` so tests can swap it out and record events instead
+ * of reaching a real Durable Object.
+ */
+export const sync = {
+  publish: async (owner: string, event: ServerEvent): Promise<void> => {
+    await env.SYNC_HUB.getByName(owner).publish(event);
+  },
+};
+
+function publish(owner: string, event: ServerEvent): Promise<void> {
+  return sync.publish(owner, event);
 }
 
 // --- D1 helpers --------------------------------------------------------------

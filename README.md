@@ -172,6 +172,19 @@ pnpm deploy             # build + wrangler deploy
 
 Durable Object の `SyncHub` は SQLite バックエンド（無料プランで可）。WebSocket Hibernation を使うので、タブを開いたまま放置しても DO は課金されない。
 
+## 自動デプロイ
+
+`main` に push されると `.github/workflows/deploy.yml` が `pnpm db:migrate:remote` → `pnpm build` → `wrangler deploy` の順に流す。手元の `pnpm deploy` と同じことを CI がやるだけなので、手動デプロイも引き続き使える。
+
+初回だけ GitHub の repository secrets を 2 つ入れる:
+
+| secret                  | 値                                                                                                                                                                         |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLOUDFLARE_ACCOUNT_ID` | `pnpm exec wrangler whoami` に出る Account ID                                                                                                                              |
+| `CLOUDFLARE_API_TOKEN`  | [API トークン](https://dash.cloudflare.com/profile/api-tokens) を「Edit Cloudflare Workers」テンプレートから作り、権限に **D1 - Edit** を足す。アカウントはこの 1 つに絞る |
+
+secrets が無いまま main に push すると Deploy ワークフローは認証エラーで落ちる（本番は変わらない）。
+
 ## Styling
 
 This project uses [Tailwind CSS](https://tailwindcss.com/) for styling.

@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tanstack-spreadsheet",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tanstack-spreadsheet",
+      "database_id": "08a279eb-a6c1-4171-83e2-20319f590c88",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "SYNC_HUB", "class_name": "SyncHub" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SyncHub"] }],
+  "vars": {
+    // Production origin. Local dev overrides this via .dev.vars.
+    "BETTER_AUTH_URL": "https://tanstack-spreadsheet.mitts-3be.workers.dev",
+  },
+}

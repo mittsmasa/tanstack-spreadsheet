@@ -6,11 +6,15 @@
     "#/*": "./src/*"
   },
   "scripts": {
-    "dev": "fnox exec -- vite dev --port 3210",
+    "dev": "sh scripts/dev-vars.sh && vite dev --port 3210",
     "generate-routes": "tsr generate",
-    "build": "fnox exec -- vite build",
-    "preview": "fnox exec -- vite preview",
-    "auth:migrate": "fnox exec -- pnpm dlx auth@1.7.2 migrate --config server/auth.ts",
+    "build": "vite build",
+    "preview": "vite preview --port 3210",
+    "deploy": "pnpm build && wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "auth:generate": "pnpm dlx auth@1.7.2 generate --config server/auth.cli.ts --output migrations/0001_auth.sql -y",
+    "db:migrate": "wrangler d1 migrations apply tanstack-spreadsheet --local",
+    "db:migrate:remote": "wrangler d1 migrations apply tanstack-spreadsheet --remote",
     "type-check": "tsc --noEmit",
     "lint": "oxlint",
     "format": "oxfmt",
@@ -23,8 +27,6 @@
   },
   "dependencies": {
     "@better-auth/mcp": "1.7.2",
-    "@libsql/client": "0.17.4",
-    "@libsql/kysely-libsql": "0.4.1",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@tailwindcss/vite": "4.3.3",
     "@tanstack/react-db": "0.3.6",
@@ -41,6 +43,8 @@
     "tailwindcss": "4.3.3"
   },
   "devDependencies": {
+    "@cloudflare/vite-plugin": "1.54.3",
+    "@cloudflare/vitest-plugin": "1.1.3",
     "@storybook/addon-vitest": "10.5.10",
     "@storybook/react-vite": "10.5.10",
     "@tailwindcss/typography": "0.5.20",
@@ -59,6 +63,7 @@
     "storybook": "10.5.10",
     "typescript": "6.0.3",
     "vite": "8.2.2",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "wrangler": "4.128.0"
   }
 }

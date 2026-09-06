@@ -1,4 +1,5 @@
 import { defineConfig } from "vite";
+import { cloudflare } from "@cloudflare/vite-plugin";
 import { devtools } from "@tanstack/devtools-vite";
 
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
@@ -6,12 +7,16 @@ import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import viteReact from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
-import { spreadsheetServer } from "./server/plugin";
-
 const config = defineConfig({
   resolve: { tsconfigPaths: true },
-  // spreadsheetServer first so /api and /mcp are handled before Start's catch-all
-  plugins: [spreadsheetServer(), devtools(), tailwindcss(), tanstackStart(), viteReact()],
+  // cloudflare() first so the Start server entry (src/server.ts) runs in workerd
+  plugins: [
+    cloudflare({ viteEnvironment: { name: "ssr" } }),
+    devtools(),
+    tailwindcss(),
+    tanstackStart(),
+    viteReact(),
+  ],
 });
 
 export default config;

@@ -1,13 +1,18 @@
-// Single shared SSE connection to the dev server's /api/stream.
+// Single shared WebSocket to the server's /api/stream.
 // All per-sheet collections, the sheet list and the book list subscribe here
-// so each tab keeps one EventSource, not one per sheet (browsers cap SSE
-// connections per host).
+// so each tab keeps one connection, not one per sheet.
 //
 // The stream is scoped to one book: the server sends that book's snapshot on
 // (re)connect ({book, books, sheets, bySheet}), then incremental change
-// batches tagged with their sheet. Switching books therefore means tearing the
-// connection down and opening a new one — setStreamBook does that, and the
-// fresh snapshot is what resyncs every subscriber.
+// batches tagged with their sheet, each as a {event, data} JSON message.
+// Switching books therefore means tearing the connection down and opening a
+// new one — setStreamBook does that, and the fresh snapshot is what resyncs
+// every subscriber.
+//
+// Unlike EventSource, a WebSocket does not reconnect by itself: a dropped
+// connection is reopened with exponential backoff (1s → 10s), and the snapshot
+// the server sends on reconnect brings every subscriber back in sync. A ping
+// every 30s keeps idle connections from being closed by intermediaries.
 //
 // The snapshot is cached — and kept up to date by folding every change batch
 // into it — so a subscriber that arrives long after the connection opened (a
@@ -40,10 +45,30 @@ type Snapshot = {
   bySheet: Record<string, SheetData>;
 };
 
+type ServerMessage =
+  | { event: "snapshot"; data: Snapshot }
+  | { event: "cells"; data: { sheet: string; changes: Array<CellChange> } }
+  | { event: "meta"; data: { sheet: string; widths: Record<string, number> } }
+  | { event: "sheets"; data: { sheets: Array<SheetInfo> } }
+  | { event: "books"; data: { books: Array<BookInfo> } };
+
+declare global {
+  interface Window {
+    /** Dev-only handle on the live socket so tests can force a disconnect. */
+    __syncWs?: WebSocket;
+  }
+}
+
+const RECONNECT_MIN_MS = 1_000;
+const RECONNECT_MAX_MS = 10_000;
+const PING_INTERVAL_MS = 30_000;
+
 const sheetSubscribers = new Map<string, Set<SheetSyncSubscriber>>();
 const listSubscribers = new Set<(sheets: Array<SheetInfo>) => void>();
 const bookSubscribers = new Set<(books: Array<BookInfo>) => void>();
-let source: EventSource | null = null;
+let socket: WebSocket | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectDelay = RECONNECT_MIN_MS;
 let currentBook: string | null = null;
 let lastSnapshot: Snapshot | null = null;
 
@@ -75,52 +100,103 @@ function foldCellChanges(sheet: string, changes: Array<CellChange>) {
   }
 }
 
-function connect(book: string) {
-  source = new EventSource(`/api/stream?book=${encodeURIComponent(book)}`);
-  source.addEventListener("snapshot", (event) => {
-    lastSnapshot = JSON.parse((event as MessageEvent).data) as Snapshot;
-    for (const [sheet, subs] of sheetSubscribers) {
-      for (const sub of subs) sub.onSnapshot?.(dataFor(sheet));
-    }
-    for (const sub of listSubscribers) sub(lastSnapshot.sheets);
-    for (const sub of bookSubscribers) sub(lastSnapshot.books);
-  });
-  source.addEventListener("cells", (event) => {
-    const { sheet, changes } = JSON.parse((event as MessageEvent).data) as {
-      sheet: string;
-      changes: Array<CellChange>;
-    };
-    foldCellChanges(sheet, changes);
-    for (const sub of sheetSubscribers.get(sheet) ?? []) sub.onCellChanges?.(changes);
-  });
-  source.addEventListener("meta", (event) => {
-    const { sheet, widths } = JSON.parse((event as MessageEvent).data) as {
-      sheet: string;
-      widths: Record<string, number>;
-    };
-    cachedData(sheet).widths = widths;
-    for (const sub of sheetSubscribers.get(sheet) ?? []) sub.onWidths?.(widths);
-  });
-  source.addEventListener("sheets", (event) => {
-    const { sheets } = JSON.parse((event as MessageEvent).data) as {
-      sheets: Array<SheetInfo>;
-    };
-    if (lastSnapshot) {
-      lastSnapshot.sheets = sheets;
-      const alive = new Set(sheets.map((sheet) => sheet.id));
-      for (const id of Object.keys(lastSnapshot.bySheet)) {
-        if (!alive.has(id)) delete lastSnapshot.bySheet[id];
+function hasSubscribers(): boolean {
+  return sheetSubscribers.size > 0 || listSubscribers.size > 0 || bookSubscribers.size > 0;
+}
+
+function handleMessage(message: ServerMessage) {
+  switch (message.event) {
+    case "snapshot": {
+      lastSnapshot = message.data;
+      for (const [sheet, subs] of sheetSubscribers) {
+        for (const sub of subs) sub.onSnapshot?.(dataFor(sheet));
       }
+      for (const sub of listSubscribers) sub(lastSnapshot.sheets);
+      for (const sub of bookSubscribers) sub(lastSnapshot.books);
+      return;
     }
-    for (const sub of listSubscribers) sub(sheets);
+    case "cells": {
+      const { sheet, changes } = message.data;
+      foldCellChanges(sheet, changes);
+      for (const sub of sheetSubscribers.get(sheet) ?? []) sub.onCellChanges?.(changes);
+      return;
+    }
+    case "meta": {
+      const { sheet, widths } = message.data;
+      cachedData(sheet).widths = widths;
+      for (const sub of sheetSubscribers.get(sheet) ?? []) sub.onWidths?.(widths);
+      return;
+    }
+    case "sheets": {
+      const { sheets } = message.data;
+      if (lastSnapshot) {
+        lastSnapshot.sheets = sheets;
+        const alive = new Set(sheets.map((sheet) => sheet.id));
+        for (const id of Object.keys(lastSnapshot.bySheet)) {
+          if (!alive.has(id)) delete lastSnapshot.bySheet[id];
+        }
+      }
+      for (const sub of listSubscribers) sub(sheets);
+      return;
+    }
+    case "books": {
+      const { books } = message.data;
+      if (lastSnapshot) lastSnapshot.books = books;
+      for (const sub of bookSubscribers) sub(books);
+      return;
+    }
+  }
+}
+
+function scheduleReconnect(book: string) {
+  if (reconnectTimer !== null) return;
+  const delay = reconnectDelay;
+  reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (socket === null && currentBook === book && hasSubscribers()) connect(book);
+  }, delay);
+}
+
+function connect(book: string) {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(
+    `${protocol}//${window.location.host}/api/stream?book=${encodeURIComponent(book)}`,
+  );
+  socket = ws;
+  // oxlint-disable-next-line no-underscore-dangle -- test hook, see Window above
+  if (import.meta.env.DEV) window.__syncWs = ws;
+  let ping: ReturnType<typeof setInterval> | null = null;
+
+  ws.addEventListener("open", () => {
+    reconnectDelay = RECONNECT_MIN_MS;
+    ping = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send("ping");
+    }, PING_INTERVAL_MS);
   });
-  source.addEventListener("books", (event) => {
-    const { books } = JSON.parse((event as MessageEvent).data) as { books: Array<BookInfo> };
-    if (lastSnapshot) lastSnapshot.books = books;
-    for (const sub of bookSubscribers) sub(books);
+  ws.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (typeof event.data !== "string" || event.data === "pong") return;
+    handleMessage(JSON.parse(event.data) as ServerMessage);
   });
-  // EventSource reconnects on its own; the server then resends a snapshot,
-  // which subscribers treat as truncate + rewrite.
+  // The close event follows every error, so a dropped connection always lands
+  // here. A socket we replaced or closed on purpose (setStreamBook) is no
+  // longer the current one and must not reconnect.
+  ws.addEventListener("close", () => {
+    if (ping !== null) clearInterval(ping);
+    if (socket !== ws) return;
+    socket = null;
+    scheduleReconnect(book);
+  });
+}
+
+function disconnect() {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  const ws = socket;
+  socket = null;
+  ws?.close();
 }
 
 /**
@@ -133,16 +209,13 @@ export function setStreamBook(book: string) {
   if (typeof window === "undefined" || book === currentBook) return;
   currentBook = book;
   lastSnapshot = null;
-  source?.close();
-  source = null;
-  if (sheetSubscribers.size > 0 || listSubscribers.size > 0 || bookSubscribers.size > 0) {
-    connect(book);
-  }
+  disconnect();
+  if (hasSubscribers()) connect(book);
 }
 
 /** Open the connection on the first subscriber, once a book is known. */
 function ensureConnected() {
-  if (source || currentBook === null) return;
+  if (socket || currentBook === null) return;
   connect(currentBook);
 }
 

@@ -6,13 +6,13 @@
 
 `server/auth.ts` が 1 つのインスタンスを作る。
 
-| 設定                     | 値                                                                                                                |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `baseURL`                | `BETTER_AUTH_URL`（既定 `http://localhost:3210`）                                                                 |
-| `database`               | `server/db.ts` の libsql client を `LibsqlDialect` で共有                                                         |
-| `socialProviders.google` | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`                                                                       |
-| `jwt()`                  | アクセストークンの署名鍵と `/jwks` を提供                                                                         |
-| `mcp({...})`             | `loginPage: "/"`、`consentPage: "/consent"`、`resource: <baseURL>/mcp`、動的クライアント登録 (DCR) を未認証で許可 |
+| 設定                     | 値                                                                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `baseURL`                | `BETTER_AUTH_URL`（既定 `http://localhost:3210`）                                                                                                                              |
+| `database`               | `server/db.ts` の libsql client を `LibsqlDialect` で共有                                                                                                                      |
+| `socialProviders.google` | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`。`GOOGLE_OAUTH_EMULATOR_URL` があるときは外し、同じ `providerId: "google"` の `genericOAuth`（ローカルのエミュレータ）に置き換える |
+| `jwt()`                  | アクセストークンの署名鍵と `/jwks` を提供                                                                                                                                      |
+| `mcp({...})`             | `loginPage: "/"`、`consentPage: "/consent"`、`resource: <baseURL>/mcp`、動的クライアント登録 (DCR) を未認証で許可                                                              |
 
 `MCP_RESOURCE` は RFC 8707 のリソース識別子で、発行するトークンをこの値に束縛し、protected resource metadata にも載せる。
 
@@ -42,6 +42,16 @@ discovery ドキュメントは origin 直下から取られる。Better Auth �
 `/` と `/b/$bookId` はセッションが無ければ `LoginScreen` を出す。ボタンは `signIn.social({ provider: "google", callbackURL: "/" })` を呼び、Google から戻ると `/` が自分の先頭ブックへリダイレクトする（無ければ作る）。
 
 ログアウトは `signOut()` 後にページを `/` へリロードする。collection と SSE がそのユーザーのデータを持っているため、再描画ではなくリロードで捨てる。
+
+### ローカルの OAuth エミュレータ
+
+`.dev.vars` に `GOOGLE_OAUTH_EMULATOR_URL` があるとき（`scripts/dev-vars.sh` の既定）、ブラウザは Google ではなく、dev server 自身が `/emulate/google/*` にホストする OAuth エミュレータ（`@emulators/google`）に飛ぶ。
+
+- エミュレータは `scripts/google-oauth-emulator.ts` の Vite plugin が Vite（Node）プロセスの middleware として動かす。`@cloudflare/vite-plugin` は Worker への dispatch を `configureServer` の post hook で登録するので、pre hook で受ける `/emulate/*` は Worker に届かない。Worker も build もエミュレータを知らない
+- `server/auth-options.ts` は `socialProviders.google` を外し、同じ `providerId: "google"` の `genericOAuth` にエミュレータの `authorizationUrl` / `tokenUrl` / `userInfoUrl` を明示して登録する。Better Auth 1.7 の genericOAuth は `signIn.social` と `/api/auth/callback/google` にそのまま乗るので、クライアントは変わらない
+- `discoveryUrl` は使わない。discovery を読むと Better Auth は id_token を JWKS で検証するが、エミュレータは HS256 署名で JWKS が空なので通らない。endpoint を明示すると id_token を decode するだけになる。ローカル限定の緩さで、本番の built-in provider は検証する
+- OAuth client は seed しないので、エミュレータは client_id / redirect_uri を検査しない。`.dev.vars` の Google の値は placeholder でよい
+- `GOOGLE_OAUTH_EMULATOR=0 pnpm dev` で本物の Google に戻る
 
 ## MCP クライアントの認可
 
@@ -133,11 +143,12 @@ flowchart LR
 
 ## 環境変数と秘密情報
 
-| 変数                                        | 用途                         | 供給元 |
-| ------------------------------------------- | ---------------------------- | ------ |
-| `BETTER_AUTH_URL`                           | baseURL、`MCP_RESOURCE` の元 | fnox   |
-| `BETTER_AUTH_SECRET`                        | Better Auth の署名秘密       | fnox   |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth                 | fnox   |
-| `LIBSQL_URL` / `LIBSQL_AUTH_TOKEN`          | 外部 libsql (Turso) への切替 | 任意   |
+| 変数                                        | 用途                                                                     | 供給元                                                                       |
+| ------------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| `BETTER_AUTH_URL`                           | baseURL、`MCP_RESOURCE` の元                                             | fnox                                                                         |
+| `BETTER_AUTH_SECRET`                        | Better Auth の署名秘密                                                   | fnox                                                                         |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth                                                             | fnox（`GOOGLE_OAUTH_EMULATOR=0` のとき。既定はエミュレータ用の placeholder） |
+| `GOOGLE_OAUTH_EMULATOR_URL`                 | ローカルの OAuth エミュレータの base URL。あるとき Google の代わりに使う | `scripts/dev-vars.sh`（`.dev.vars` のみ、本番では未設定）                    |
+| `LIBSQL_URL` / `LIBSQL_AUTH_TOKEN`          | 外部 libsql (Turso) への切替                                             | 任意                                                                         |
 
 `pnpm dev` / `build` / `preview` / `auth:migrate` は `fnox exec --` を内包し、`fnox.toml` の age 暗号文を OS keychain の秘密鍵で復号して注入する。`vite.config.ts` が `server/auth.ts` を読むため、build でも認証情報が必要である。`server/env.ts` は `.env` があれば `process.env` に読み込むが、通常は fnox が供給する。CI は fnox を使わず、`type-check` と `lint` だけを回す。

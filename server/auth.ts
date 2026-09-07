@@ -26,7 +26,12 @@ function createAuth() {
   return betterAuth({
     ...authOptions({
       baseURL: BASE_URL,
-      google: { clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET },
+      google: {
+        clientId: env.GOOGLE_CLIENT_ID,
+        clientSecret: env.GOOGLE_CLIENT_SECRET,
+        // only .dev.vars sets this; unset (undefined at runtime) in production
+        emulatorUrl: env.GOOGLE_OAUTH_EMULATOR_URL || undefined,
+      },
     }),
     secret: env.BETTER_AUTH_SECRET,
     database: env.DB,

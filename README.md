@@ -18,36 +18,51 @@ Better Auth による Google ログイン必須。未ログインではログイ
 
 ## セットアップ
 
-1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) で OAuth 同意画面を設定し、「OAuth クライアント ID」を**ウェブアプリケーション**として作成する
-2. 承認済みのリダイレクト URI に `http://localhost:3210/api/auth/callback/google` を追加する
-3. 同意画面の「テストユーザー」に自分の Google アカウントを追加する（公開ステータスが「テスト中」の間、ログインできるのはここに載ったユーザーだけ）
-4. age の秘密鍵を OS keychain に入れる（**リポジトリ外に出るのはこの鍵だけ**）
+ローカルの Google ログインは、dev server が同じ origin の `/emulate/google` にホストする OAuth エミュレータ（[`@emulators/google`](https://github.com/vercel-labs/emulate)）を使う。Google Cloud Console の credentials は要らない。
+
+1. age の秘密鍵を OS keychain に入れる（**リポジトリ外に出るのはこの鍵だけ**）
 
 ```bash
 security add-generic-password -s fnox -a age-key -w '<AGE-SECRET-KEY-...>' -U
 ```
 
-5. 設定を [fnox](https://github.com/jdx/fnox) の age プロバイダで暗号化して `fnox.toml` に入れる
+2. `BETTER_AUTH_SECRET` を [fnox](https://github.com/jdx/fnox) の age プロバイダで暗号化して `fnox.toml` に入れる
 
 ```bash
 openssl rand -base64 32 | fnox --no-daemon set BETTER_AUTH_SECRET
-fnox --no-daemon set GOOGLE_CLIENT_ID
-fnox --no-daemon set GOOGLE_CLIENT_SECRET
 ```
 
 **`--no-daemon` は必須。**付けないと `✓ Set secret` と表示されるのに書き込まれず、あとで `not found` になる（fnox 1.32.0 で確認）。
 
-6. ローカル D1 にスキーマを当てる（auth のテーブルもスプレッドシートと同じ D1 に同居する）
+3. ローカル D1 にスキーマを当てる（auth のテーブルもスプレッドシートと同じ D1 に同居する）
 
 ```bash
 pnpm db:migrate
 ```
 
+`pnpm dev` で `/` を開いて「Google でログイン」を押すと、エミュレータのアカウント選択画面が出る。`dev@example.com` と `alice@example.com`（`scripts/google-oauth-emulator.ts` で seed）に加えて、エミュレータ自身が足す `testuser@gmail.com` が並ぶ。どれを選んでもそのままログインできる。
+
+### 本物の Google でログインする
+
+本番のデプロイと、ローカルで実クレデンシャルを試すときに必要。
+
+1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) で OAuth 同意画面を設定し、「OAuth クライアント ID」を**ウェブアプリケーション**として作成する
+2. 承認済みのリダイレクト URI に `http://localhost:3210/api/auth/callback/google`（ローカル）と本番 origin の同パスを追加する
+3. 同意画面の「テストユーザー」に自分の Google アカウントを追加する（公開ステータスが「テスト中」の間、ログインできるのはここに載ったユーザーだけ）
+4. credentials を fnox に入れる
+
+```bash
+fnox --no-daemon set GOOGLE_CLIENT_ID
+fnox --no-daemon set GOOGLE_CLIENT_SECRET
+```
+
+5. ローカルで使うときは `GOOGLE_OAUTH_EMULATOR=0 pnpm dev`。エミュレータを迂回して `accounts.google.com` に飛ぶ
+
 ## 設定の持ち方
 
 暗号化された値は `fnox.toml` に直接入っていて、復号できるのは age 秘密鍵を持つ人だけ。その鍵は OS keychain にあり、リポジトリには含まれない。age プロバイダの `identity = { provider = "keychain", value = "age-key" }` が keychain から鍵を取り出すので、事前に環境変数を用意する必要はない。
 
-`pnpm dev` は先に `scripts/dev-vars.sh` を実行し、fnox から `BETTER_AUTH_SECRET` / `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` を取り出して `.dev.vars`（gitignore 済み、owner のみ読める）に書く。Cloudflare の Vite plugin がこれを Worker の secrets として読み込む。`BETTER_AUTH_URL` はローカルでは `http://localhost:3210` を同スクリプトが書き、本番では `wrangler.jsonc` の `vars` が持つ。`pnpm build` に設定は要らない。
+`pnpm dev` は先に `scripts/dev-vars.sh` を実行し、`.dev.vars`（gitignore 済み、owner のみ読める）を書く。Cloudflare の Vite plugin がこれを Worker の secrets として読み込む。既定では fnox から取るのは `BETTER_AUTH_SECRET` だけで、`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` はエミュレータが検査しない placeholder、`GOOGLE_OAUTH_EMULATOR_URL` はエミュレータの base URL（`http://localhost:3210/emulate/google`）を書く。`GOOGLE_OAUTH_EMULATOR=0` のときは `GOOGLE_OAUTH_EMULATOR_URL` を書かず、Google の値も fnox から取る。`BETTER_AUTH_URL` はローカルでは `http://localhost:3210` を同スクリプトが書き、本番では `wrangler.jsonc` の `vars` が持つ。`pnpm build` に設定は要らない。
 
 本番の secrets は fnox ではなく `wrangler secret put` で Cloudflare に置く（Deploy の節）。
 

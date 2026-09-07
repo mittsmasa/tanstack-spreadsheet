@@ -140,6 +140,65 @@ function parseMutationPayload(body: unknown): Array<CellRow> | null {
   return parsed;
 }
 
+/** A 2D array of cell inputs (row-major); numbers are stringified and null
+ * means "". Rows may differ in length. Returns null when malformed. */
+function parseGridPayload(input: unknown): Array<Array<string>> | null {
+  if (!Array.isArray(input)) return null;
+  const grid: Array<Array<string>> = [];
+  for (const row of input) {
+    if (!Array.isArray(row)) return null;
+    const cells: Array<string> = [];
+    for (const value of row) {
+      if (value === null) cells.push("");
+      else if (typeof value === "string") cells.push(value);
+      else if (typeof value === "number" && Number.isFinite(value)) cells.push(String(value));
+      else return null;
+    }
+    grid.push(cells);
+  }
+  return grid;
+}
+
+type CellRange = { cols: [number, number]; rows: [number, number]; size: number };
+
+/** Parse "A1:C10" (a single "A1" also works) into a normalised rectangle, or
+ * null when malformed. The two corners may be given in any order. */
+function parseRange(input: string): CellRange | null {
+  const [startId, endId = startId] = input.split(":", 2);
+  const start = parseCellId(startId ?? "");
+  const end = parseCellId(endId ?? "");
+  if (!start || !end) return null;
+  const cols: [number, number] = [
+    Math.min(start.colIndex, end.colIndex),
+    Math.max(start.colIndex, end.colIndex),
+  ];
+  const rows: [number, number] = [
+    Math.min(start.rowNumber, end.rowNumber),
+    Math.max(start.rowNumber, end.rowNumber),
+  ];
+  return { cols, rows, size: (cols[1] - cols[0] + 1) * (rows[1] - rows[0] + 1) };
+}
+
+function inRange({ cols, rows }: CellRange, id: string): boolean {
+  const cell = parseCellId(id);
+  return (
+    cell !== null &&
+    cell.colIndex >= cols[0] &&
+    cell.colIndex <= cols[1] &&
+    cell.rowNumber >= rows[0] &&
+    cell.rowNumber <= rows[1]
+  );
+}
+
+/** Row-major cell order (A1, B1, A2, ...), unlike plain string order where
+ * "A10" sorts before "A2". */
+function byPosition(a: string, b: string): number {
+  const left = parseCellId(a);
+  const right = parseCellId(b);
+  if (!left || !right) return a.localeCompare(b);
+  return left.rowNumber - right.rowNumber || left.colIndex - right.colIndex;
+}
+
 // --- MCP ---------------------------------------------------------------------
 
 type ToolResult = {
@@ -153,6 +212,24 @@ function toolJson(value: unknown): ToolResult {
 
 function toolError(message: string): ToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
+}
+
+/** A tool's `range` argument, validated and size-guarded. `text` is the
+ * normalised input, echoed back so callers recognise their own range. */
+function rangeArg(input: unknown): { text: string; range: CellRange } | ToolResult {
+  const text = typeof input === "string" ? input.trim().toUpperCase() : "";
+  const range = parseRange(text);
+  if (!range) return toolError(`invalid range: ${String(input)}`);
+  if (range.size > MAX_RANGE_CELLS) {
+    return toolError(`range too large: ${range.size} cells (max ${MAX_RANGE_CELLS})`);
+  }
+  return { text, range };
+}
+
+/** Rename / delete tools must name their target: the usual "omitted means the
+ * first one" default would turn a forgotten argument into a destructive act. */
+function requireRef(args: Record<string, unknown>, key: "book" | "sheet"): ToolResult | null {
+  return args[key] === undefined ? toolError(`${key} is required: pass its id or name`) : null;
 }
 
 async function evaluatedCells(sheet: string): Promise<{
@@ -231,7 +308,20 @@ const SHEET_PROPERTY = {
     'Sheet id or sheet name within the book (see list_sheets). Omitted: the book\'s first sheet ("シート1" unless renamed).',
 };
 
-const TOOLS = [
+const BOOK_REQUIRED = {
+  type: "string",
+  description: "Book id or book name (see list_books). Required.",
+};
+
+const SHEET_REQUIRED = {
+  type: "string",
+  description: "Sheet id or sheet name within the book (see list_sheets). Required.",
+};
+
+const WRITE_NOTE =
+  'Changes appear live in open browser tabs viewing that book. Undo history is per client: each call is recorded as one undoable entry owned by the "mcp" client, so browser users cannot undo it (and their undos never revert it).';
+
+export const TOOLS = [
   {
     name: "list_books",
     description:
@@ -295,8 +385,7 @@ const TOOLS = [
   },
   {
     name: "set_cells",
-    description:
-      'Write cells in one batch. Each entry is {id, raw}; raw is the user-level input (a leading "=" makes it a formula) and an empty string deletes the cell. The whole batch is rejected if any id is invalid. Changes appear live in open browser tabs viewing that book. Undo history is per client: each batch is recorded as one undoable entry owned by the "mcp" client, so browser users cannot undo it (and their undos never revert it).',
+    description: `Write cells in one batch. Each entry is {id, raw}; raw is the user-level input (a leading "=" makes it a formula) and an empty string deletes the cell. The whole batch is rejected if any id is invalid. ${WRITE_NOTE}`,
     inputSchema: {
       type: "object",
       properties: {
@@ -326,9 +415,123 @@ const TOOLS = [
       properties: { sheet: SHEET_PROPERTY, book: BOOK_PROPERTY },
     },
   },
+  {
+    name: "set_range",
+    description: `Write a rectangular block of cells starting at a top-left cell, given as a row-major 2D array (rows[r][c] lands at start + r rows + c columns). Values follow set_cells: a leading "=" makes a formula, "" (or null) deletes the cell, numbers are written as text. Rows may differ in length. Rejected as a whole if the block exceeds ${MAX_RANGE_CELLS} cells. ${WRITE_NOTE}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        start: { type: "string", description: 'Top-left cell id, e.g. "B2"' },
+        rows: {
+          type: "array",
+          description: 'Row-major values, e.g. [["name", "qty"], ["apple", 3]]',
+          items: { type: "array", items: { type: ["string", "number", "null"] } },
+        },
+        sheet: SHEET_PROPERTY,
+        book: BOOK_PROPERTY,
+      },
+      required: ["start", "rows"],
+    },
+  },
+  {
+    name: "clear_range",
+    description: `Delete every cell inside a rectangular range like "A1:C10" (a single cell id also works). Cells outside the range are untouched. Rejected if the range exceeds ${MAX_RANGE_CELLS} cells. ${WRITE_NOTE}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        range: { type: "string", description: 'Range, e.g. "A1:C10"' },
+        sheet: SHEET_PROPERTY,
+        book: BOOK_PROPERTY,
+      },
+      required: ["range"],
+    },
+  },
+  {
+    name: "find_cells",
+    description:
+      "Search one sheet for cells whose raw input or evaluated value contains the query (case-insensitive substring by default; set regex: true for a JavaScript regular expression). Returns matches as {id, raw, value} in row-major order, plus the total count and whether the list was cut at `limit`. Cheaper than get_snapshot for locating where something lives.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Substring to look for, or a regex when regex is true",
+        },
+        regex: {
+          type: "boolean",
+          description: "Treat query as a regular expression (default false)",
+        },
+        caseSensitive: { type: "boolean", description: "Match case exactly (default false)" },
+        limit: {
+          type: "integer",
+          description: "Maximum matches to return (default 200)",
+          minimum: 1,
+        },
+        sheet: SHEET_PROPERTY,
+        book: BOOK_PROPERTY,
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "get_dimensions",
+    description:
+      'Report the used extent of one sheet: the number of non-empty cells, the highest used row and column counts, and the bounding range from A1 (e.g. "A1:F20") — or range: null when the sheet is empty. Use it to size a get_range call instead of reading the whole snapshot.',
+    inputSchema: {
+      type: "object",
+      properties: { sheet: SHEET_PROPERTY, book: BOOK_PROPERTY },
+    },
+  },
+  {
+    name: "rename_book",
+    description:
+      "Rename one of your books. Fails if the new name is already taken by another of your books.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        book: BOOK_REQUIRED,
+        name: { type: "string", description: "New book name (must be unique)" },
+      },
+      required: ["book", "name"],
+    },
+  },
+  {
+    name: "delete_book",
+    description:
+      "DESTRUCTIVE: permanently delete a book together with every sheet, cell, column width and undo history inside it. There is no undo. The last remaining book cannot be deleted. Confirm with the user before calling this.",
+    inputSchema: {
+      type: "object",
+      properties: { book: BOOK_REQUIRED },
+      required: ["book"],
+    },
+  },
+  {
+    name: "rename_sheet",
+    description:
+      "Rename a sheet within a book. Fails if the new name is already taken in that book.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sheet: SHEET_REQUIRED,
+        name: { type: "string", description: "New sheet name (must be unique within the book)" },
+        book: BOOK_PROPERTY,
+      },
+      required: ["sheet", "name"],
+    },
+  },
+  {
+    name: "delete_sheet",
+    description:
+      "DESTRUCTIVE: permanently delete a sheet with all its cells, column widths and undo history. There is no undo. The last remaining sheet of a book cannot be deleted. Confirm with the user before calling this.",
+    inputSchema: {
+      type: "object",
+      properties: { sheet: SHEET_REQUIRED, book: BOOK_PROPERTY },
+      required: ["sheet"],
+    },
+  },
 ];
 
-async function callTool(
+export async function callTool(
   owner: string,
   name: string,
   args: Record<string, unknown>,
@@ -371,20 +574,9 @@ async function callTool(
     case "get_range": {
       const target = await resolveTarget(owner, args);
       if ("error" in target) return toolError(target.error);
-      const input = typeof args.range === "string" ? args.range.trim().toUpperCase() : "";
-      const [startId, endId = startId] = input.split(":", 2);
-      const start = parseCellId(startId ?? "");
-      const end = parseCellId(endId ?? "");
-      if (!start || !end) return toolError(`invalid range: ${String(args.range)}`);
-      const cols = [Math.min(start.colIndex, end.colIndex), Math.max(start.colIndex, end.colIndex)];
-      const rows = [
-        Math.min(start.rowNumber, end.rowNumber),
-        Math.max(start.rowNumber, end.rowNumber),
-      ];
-      const size = (cols[1] - cols[0] + 1) * (rows[1] - rows[0] + 1);
-      if (size > MAX_RANGE_CELLS) {
-        return toolError(`range too large: ${size} cells (max ${MAX_RANGE_CELLS})`);
-      }
+      const parsed = rangeArg(args.range);
+      if ("content" in parsed) return parsed;
+      const { cols, rows } = parsed.range;
       const { rawById, valueOf } = await evaluatedCells(target.sheet);
       const grid: Array<Array<{ id: string; raw: string | null; value: string }>> = [];
       for (let r = rows[0]; r <= rows[1]; r++) {
@@ -396,7 +588,7 @@ async function callTool(
         }
         grid.push(row);
       }
-      return toolJson({ range: input, rows: grid });
+      return toolJson({ range: parsed.text, rows: grid });
     }
     case "set_cells": {
       const target = await resolveTarget(owner, args);
@@ -418,6 +610,146 @@ async function callTool(
         .toSorted(([a], [b]) => a.localeCompare(b))
         .map(([id, raw]) => ({ id, raw, value: valueOf(id) }));
       return toolJson({ cells });
+    }
+    case "set_range": {
+      const target = await resolveTarget(owner, args);
+      if ("error" in target) return toolError(target.error);
+      const startText = typeof args.start === "string" ? args.start.trim().toUpperCase() : "";
+      const start = parseCellId(startText);
+      if (!start) return toolError(`invalid start cell: ${String(args.start)}`);
+      const grid = parseGridPayload(args.rows);
+      if (!grid) {
+        return toolError(
+          'invalid rows payload: expected a row-major 2D array of strings, e.g. [["a", "b"], ["c", "d"]]',
+        );
+      }
+      const size = grid.reduce((n, row) => n + row.length, 0);
+      if (size > MAX_RANGE_CELLS) {
+        return toolError(`too many cells: ${size} (max ${MAX_RANGE_CELLS})`);
+      }
+      const cells: Array<CellRow> = [];
+      grid.forEach((row, r) => {
+        row.forEach((raw, c) => {
+          cells.push({ id: cellId(start.colIndex + c, start.rowNumber + r), raw });
+        });
+      });
+      const width = Math.max(1, ...grid.map((row) => row.length));
+      const height = Math.max(1, grid.length);
+      const end = cellId(start.colIndex + width - 1, start.rowNumber + height - 1);
+      const changes = await applyCellMutations(cells, target.sheet, "mcp");
+      return toolJson({ range: `${startText}:${end}`, applied: changes.length });
+    }
+    case "clear_range": {
+      const target = await resolveTarget(owner, args);
+      if ("error" in target) return toolError(target.error);
+      const parsed = rangeArg(args.range);
+      if ("content" in parsed) return parsed;
+      // only cells that exist: an absent cell is a no-op for applyCellMutations
+      // anyway, and this keeps the batch proportional to the data, not the range
+      const cells = (await getCells(target.sheet))
+        .filter(({ id }) => inRange(parsed.range, id))
+        .map(({ id }) => ({ id, raw: "" }));
+      const changes = await applyCellMutations(cells, target.sheet, "mcp");
+      return toolJson({ range: parsed.text, cleared: changes.length });
+    }
+    case "find_cells": {
+      const target = await resolveTarget(owner, args);
+      if ("error" in target) return toolError(target.error);
+      const query = args.query;
+      if (typeof query !== "string" || query === "") {
+        return toolError("query must be a non-empty string");
+      }
+      const caseSensitive = args.caseSensitive === true;
+      let matches: (text: string) => boolean;
+      if (args.regex === true) {
+        let pattern: RegExp;
+        try {
+          pattern = new RegExp(query, caseSensitive ? "u" : "iu");
+        } catch (error) {
+          return toolError(
+            `invalid regex: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        matches = (text) => pattern.test(text);
+      } else {
+        const needle = caseSensitive ? query : query.toLowerCase();
+        matches = (text) => (caseSensitive ? text : text.toLowerCase()).includes(needle);
+      }
+      const limit = args.limit === undefined ? 200 : args.limit;
+      if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1) {
+        return toolError(`invalid limit: ${String(args.limit)}`);
+      }
+      const { rawById, valueOf } = await evaluatedCells(target.sheet);
+      const found = [...rawById.keys()]
+        .toSorted(byPosition)
+        .map((id) => ({ id, raw: rawById.get(id) ?? "", value: valueOf(id) }))
+        .filter(({ raw, value }) => matches(raw) || matches(value));
+      return toolJson({
+        total: found.length,
+        truncated: found.length > limit,
+        matches: found.slice(0, limit),
+      });
+    }
+    case "get_dimensions": {
+      const target = await resolveTarget(owner, args);
+      if ("error" in target) return toolError(target.error);
+      const cells = await getCells(target.sheet);
+      let maxCol = -1;
+      let maxRow = 0;
+      for (const { id } of cells) {
+        const cell = parseCellId(id);
+        if (!cell) continue;
+        maxCol = Math.max(maxCol, cell.colIndex);
+        maxRow = Math.max(maxRow, cell.rowNumber);
+      }
+      if (maxRow === 0) return toolJson({ cellCount: 0, rows: 0, columns: 0, range: null });
+      return toolJson({
+        cellCount: cells.length,
+        rows: maxRow,
+        columns: maxCol + 1,
+        range: `A1:${cellId(maxCol, maxRow)}`,
+      });
+    }
+    case "rename_book": {
+      const missing = requireRef(args, "book");
+      if (missing) return missing;
+      const book = await resolveBook(owner, args.book);
+      if ("error" in book) return toolError(book.error);
+      if (typeof args.name !== "string")
+        return toolError(`invalid book name: ${String(args.name)}`);
+      const result = await renameBook(owner, book.id, args.name);
+      if (!result.ok) return toolError(`could not rename book: ${result.error}`);
+      return toolJson({ book: result.book });
+    }
+    case "delete_book": {
+      const missing = requireRef(args, "book");
+      if (missing) return missing;
+      const book = await resolveBook(owner, args.book);
+      if ("error" in book) return toolError(book.error);
+      const result = await deleteBook(owner, book.id);
+      if (!result.ok) return toolError(`could not delete book: ${result.error}`);
+      return toolJson({ deleted: result.book });
+    }
+    case "rename_sheet": {
+      const missing = requireRef(args, "sheet");
+      if (missing) return missing;
+      const target = await resolveTarget(owner, args);
+      if ("error" in target) return toolError(target.error);
+      if (typeof args.name !== "string") {
+        return toolError(`invalid sheet name: ${String(args.name)}`);
+      }
+      const result = await renameSheet(target.book, target.sheet, args.name);
+      if (!result.ok) return toolError(`could not rename sheet: ${result.error}`);
+      return toolJson({ book: target.book, sheet: result.sheet });
+    }
+    case "delete_sheet": {
+      const missing = requireRef(args, "sheet");
+      if (missing) return missing;
+      const target = await resolveTarget(owner, args);
+      if ("error" in target) return toolError(target.error);
+      const result = await deleteSheet(target.book, target.sheet);
+      if (!result.ok) return toolError(`could not delete sheet: ${result.error}`);
+      return toolJson({ book: target.book, deleted: result.sheet });
     }
     default:
       return toolError(`unknown tool: ${name}`);

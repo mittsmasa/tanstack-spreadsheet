@@ -108,18 +108,28 @@ claude mcp add --transport http tanstack-spreadsheet http://localhost:3210/mcp
 
 ### ツール
 
-| ツール         | 引数                                    | 返り値                                                |
-| -------------- | --------------------------------------- | ----------------------------------------------------- |
-| `list_books`   | なし                                    | `{ books: [{id, name}] }` 作成順                      |
-| `add_book`     | `name?`                                 | `{ book }`。「シート1」付き                           |
-| `list_sheets`  | `book?`                                 | `{ book, sheets: [{id, name}] }` 作成順               |
-| `add_sheet`    | `name?`, `book?`                        | `{ book, sheet }`                                     |
-| `get_cell`     | `id`, `sheet?`, `book?`                 | `{ id, raw, value }`。未設定は `raw: null, value: ""` |
-| `get_range`    | `range` ("A1:C10")、`sheet?`、`book?`   | `{ range, rows: [[{id, raw, value}]] }` 行優先        |
-| `set_cells`    | `cells: [{id, raw}]`, `sheet?`, `book?` | `{ applied }`。`raw: ""` は削除                       |
-| `get_snapshot` | `sheet?`, `book?`                       | `{ cells: [{id, raw, value}] }` 非空のみ、id 順       |
+| ツール           | 引数                                                                        | 返り値                                                        |
+| ---------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `list_books`     | なし                                                                        | `{ books: [{id, name}] }` 作成順                              |
+| `add_book`       | `name?`                                                                     | `{ book }`。「シート1」付き                                   |
+| `list_sheets`    | `book?`                                                                     | `{ book, sheets: [{id, name}] }` 作成順                       |
+| `add_sheet`      | `name?`, `book?`                                                            | `{ book, sheet }`                                             |
+| `get_cell`       | `id`, `sheet?`, `book?`                                                     | `{ id, raw, value }`。未設定は `raw: null, value: ""`         |
+| `get_range`      | `range` ("A1:C10")、`sheet?`、`book?`                                       | `{ range, rows: [[{id, raw, value}]] }` 行優先                |
+| `set_cells`      | `cells: [{id, raw}]`, `sheet?`, `book?`                                     | `{ applied }`。`raw: ""` は削除                               |
+| `get_snapshot`   | `sheet?`, `book?`                                                           | `{ cells: [{id, raw, value}] }` 非空のみ、id 順               |
+| `set_range`      | `start` ("B2"), `rows: [[...]]` 行優先, `sheet?`, `book?`                   | `{ range, applied }`。`""` / `null` は削除、number は文字列化 |
+| `clear_range`    | `range` ("A1:C10"), `sheet?`, `book?`                                       | `{ range, cleared }`。範囲内の既存セルだけ削除                |
+| `find_cells`     | `query`, `regex?`, `caseSensitive?`, `limit?` (既定 200), `sheet?`, `book?` | `{ total, truncated, matches: [{id, raw, value}] }` 行→列順   |
+| `get_dimensions` | `sheet?`, `book?`                                                           | `{ cellCount, rows, columns, range }`。空なら `range: null`   |
+| `rename_book`    | `book` (必須), `name`                                                       | `{ book }`                                                    |
+| `delete_book`    | `book` (必須)                                                               | `{ deleted: book }`。中身ごと削除、最後の 1 冊は `last-book`  |
+| `rename_sheet`   | `sheet` (必須), `name`, `book?`                                             | `{ book, sheet }`                                             |
+| `delete_sheet`   | `sheet` (必須), `book?`                                                     | `{ book, deleted: sheet }`。最後の 1 枚は `last-sheet`        |
 
-`value` は `displayValue` で評価した表示値で、ブラウザと同じ `src/lib/formula.ts` を使う。
+`value` は `displayValue` で評価した表示値で、ブラウザと同じ `src/lib/formula.ts` を使う。`find_cells` は raw と `value` の両方を検索対象にするので、数式セルは入力（`=C1*2`）でも結果（`20`）でも見つかる。
+
+rename / delete 系だけは `book` / `sheet` の省略を認めない。他のツールの「省略は先頭」を踏襲すると、引数の付け忘れが先頭ブックの削除になるためである。
 
 ### 引数の解決規則
 
@@ -135,10 +145,11 @@ flowchart LR
 
 ### 制限とエラー
 
-- `get_range` は 10,000 セルまで。超えると `range too large`
+- `get_range` / `clear_range` は 10,000 セルまで。超えると `range too large`。`set_range` も配列の総セル数（各行の長さの合計）が 10,000 を超えると `too many cells`
 - セル id は大文字に正規化して検証する。1 つでも不正なら `set_cells` はバッチ全体を拒否する
 - ツールのエラーは `isError: true` のテキストで返し、例外も `callTool` の外で同じ形に包む
-- `set_cells` の履歴は client id `"mcp"` に記録する。ブラウザのユーザーは MCP の書き込みを undo できず、逆も同様である
+- 書き込み系（`set_cells` / `set_range` / `clear_range`）の履歴は client id `"mcp"` に記録する。ブラウザのユーザーは MCP の書き込みを undo できず、逆も同様である
+- `callTool` はテスト用に export されており、`server/api.db.test.ts` が db project（workerd + ローカル D1）から直接叩く。OAuth ゲートはテストの対象外
 - 行 / 列の挿入、削除、移動などの構造操作ツールは未実装である
 
 ## 環境変数と秘密情報

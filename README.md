@@ -108,20 +108,32 @@ claude mcp add --transport http tanstack-spreadsheet http://localhost:3210/mcp
 
 エンドポイントは OAuth で保護されている。初回接続時にクライアントが自分を動的登録（DCR）し、ブラウザが開いて Google ログイン → 認可画面へ進む。許可するとアクセストークンが発行され、以降はそれで接続する。トークンはログインしたユーザーに紐づく。
 
+手で OAuth を回して `/mcp` を叩くとき（curl 等）は、DCR の `redirect_uris` に `http://localhost:...` を渡すと `invalid_redirect_uri`（Better Auth は `localhost` を loopback と見なさない）。`http://127.0.0.1:3210/...` にして `application_type: "native"`、`token_endpoint_auth_method: "none"` で登録し、PKCE（S256）と `resource=http://localhost:3210/mcp` を付けて authorize → token を通す。ローカルは OAuth エミュレータなので、ログインは `dev@example.com` を選ぶだけでよい。
+
 ツール:
 
-| tool           | 説明                                                              |
-| -------------- | ----------------------------------------------------------------- |
-| `get_cell`     | セル 1 つの raw と評価値を取得                                    |
-| `get_range`    | `"A1:C10"` 形式の範囲を 2 次元配列で取得                          |
-| `set_cells`    | セルの一括書き込み（`raw: ""` で削除）。開いているタブに即時反映  |
-| `get_snapshot` | 全非空セルの一覧（エクスポート向き）                              |
-| `list_sheets`  | 1 つのブックのシート `{id, name}` 一覧（作成順）                  |
-| `add_sheet`    | シート作成（name 省略時は「シート{N}」を自動採番）                |
-| `list_books`   | 自分のブックの `{id, name}` 一覧（作成順）                        |
-| `add_book`     | ブック作成（「シート1」が 1 枚ついてくる。name 省略時は自動採番） |
+| tool             | 説明                                                                        |
+| ---------------- | --------------------------------------------------------------------------- |
+| `get_cell`       | セル 1 つの raw と評価値を取得                                              |
+| `get_range`      | `"A1:C10"` 形式の範囲を 2 次元配列で取得                                    |
+| `set_cells`      | セルの一括書き込み（`raw: ""` で削除）。開いているタブに即時反映            |
+| `get_snapshot`   | 全非空セルの一覧（エクスポート向き）                                        |
+| `list_sheets`    | 1 つのブックのシート `{id, name}` 一覧（作成順）                            |
+| `add_sheet`      | シート作成（name 省略時は「シート{N}」を自動採番）                          |
+| `list_books`     | 自分のブックの `{id, name}` 一覧（作成順）                                  |
+| `add_book`       | ブック作成（「シート1」が 1 枚ついてくる。name 省略時は自動採番）           |
+| `set_range`      | 2 次元配列（行優先）を `start` セル起点で一括書き込み。`""` / `null` は削除 |
+| `clear_range`    | `"A1:C10"` 形式の範囲内のセルを一括削除                                     |
+| `find_cells`     | raw または評価値の部分一致（`regex: true` で正規表現）でセルを検索          |
+| `get_dimensions` | 非空セル数と使用範囲（`"A1:F20"`、空なら `null`）                           |
+| `rename_book`    | ブックのリネーム（`book` 必須）                                             |
+| `delete_book`    | ブックを中身ごと削除（`book` 必須、最後の 1 冊は不可）                      |
+| `rename_sheet`   | シートのリネーム（`sheet` 必須）                                            |
+| `delete_sheet`   | シートを中身ごと削除（`sheet` 必須、最後の 1 枚は不可）                     |
 
-`list_books` / `add_book` 以外のツールは optional な `book` パラメータを取る（ブック id または名前で指定、省略時は先頭のブック）。セルを扱う 4 ツールと `add_sheet` はさらに optional な `sheet` を取る（省略時はそのブックの先頭シート）。
+`list_books` / `add_book` 以外のツールは `book` パラメータを取る（ブック id または名前で指定、省略時は先頭のブック）。セルを扱うツールと `add_sheet` / `rename_sheet` / `delete_sheet` はさらに `sheet` を取る（省略時はそのブックの先頭シート）。ただし rename / delete 系は対象の省略を認めず、`book` / `sheet` を明示しないとエラーになる（省略が「先頭を消す」に化けないため）。
+
+範囲を受けるツール（`get_range` / `clear_range`）と `set_range` は 10,000 セルを上限とする。書き込み系（`set_cells` / `set_range` / `clear_range`）はいずれも client id `"mcp"` の undo 履歴として記録され、ブラウザ側からは undo できない。
 
 トークンはログインしたユーザーに紐づき、**全ツールがそのユーザーのブックしか触らない**。他人のブック id を渡しても `unknown book` になる。存在しないシートへの書き込みはエラーになる（暗黙作成はしない — 先に `add_sheet`）。
 

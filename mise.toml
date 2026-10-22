@@ -1,5 +1,5 @@
 [tools]
-node = "24.19.0"
+node = "24.22.1"
 pnpm = "11.20.0"
 
 # 認証情報は fnox が keychain から注入する。scripts/dev-vars.sh が pnpm dev の前に

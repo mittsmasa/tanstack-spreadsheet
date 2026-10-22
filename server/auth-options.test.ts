@@ -32,7 +32,6 @@ describe("authOptions", () => {
         authorizationUrl: `${emulatorUrl}/o/oauth2/v2/auth`,
         tokenUrl: `${emulatorUrl}/oauth2/token`,
         userInfoUrl: `${emulatorUrl}/oauth2/v2/userinfo`,
-        accountIssuer: emulatorUrl,
         pkce: true,
       }),
     ]);

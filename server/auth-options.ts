@@ -78,7 +78,6 @@ function googleEmulator(url: string, google: { clientId: string; clientSecret: s
         authorizationUrl: `${url}/o/oauth2/v2/auth`,
         tokenUrl: `${url}/oauth2/token`,
         userInfoUrl: `${url}/oauth2/v2/userinfo`,
-        accountIssuer: url,
         scopes: ["openid", "email", "profile"],
         pkce: true,
       },
